@@ -107,3 +107,6 @@ jobs:
 
       - name: Load, poison, boundary and recovery tests (evaluator and native)
         run: scripts/test-stage4.sh
+
+      - name: Memory exhaustion simulation and WAL recovery verification
+        run: scripts/test-mem-exhaustion.sh
