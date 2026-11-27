@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  sigil:
+    name: Sigil validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check out the Sigil compiler
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil
+          ref: 5735a993d2cea0c02bc15e9b47f003754b8fa217
+          path: .sigil-compiler
+          persist-credentials: false
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      - name: Build the Sigil compiler
+        working-directory: .sigil-compiler
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable build --locked --bin sigil
+          echo "$PWD/target/debug" >> "$GITHUB_PATH"
+
+      - name: sigil fmt
+        run: sigil fmt --check herald_queue.sigil herald_queue_test.sigil
+
+      - name: sigil check
+        run: sigil check --root . herald_queue_test.sigil
+
+      - name: sigil run
+        run: |
+          result="$(sigil run --root . herald_queue_test.sigil main)"
+          echo "$result"
+          test "$result" = 0
+
+      - name: sigil build
+        run: |
+          test_binary="$RUNNER_TEMP/herald-queue-test"
+          sigil build --root . herald_queue_test.sigil main -o "$test_binary"
+          result="$("$test_binary")"
+          echo "$result"
+          test "$result" = 0
