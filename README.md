@@ -84,3 +84,30 @@ scripts/test-tcp.sh
 ```
 
 `herald_wire_test.sigil` は符号化の往復・拒否・上限と、変異フレームのファジング（受理したフレームは再符号化で元と一致する性質を検査）を行います。`herald_tcp_test.sigil` はループバックでサーバーとクライアントを動かし、基本操作・1 MiB ペイロード・ロングポーリング・不正フレーム・低速接続・接続数上限・永続モード・変異フレーム 240 件の実接続ファジングを検査します。
+
+## 負荷・境界試験と公開前記録（第4段）
+
+ADR 0066 決定 5 第4段に基づき、大量ジョブ投入時の資源上限（メモリ・スロット再利用）、Poison Message 耐性、ディスク枯渇時の WAL 同期保証、DoS 境界防御を検証します。
+
+### 試験項目
+
+- **Poison Message 耐性とワーカー突然死**: ワーカーが貸出中にクラッシュ（切断）した場合、リース期限切れ後に自動的に不可視状態が解除され、`attempt` が 1 加算されて再配送されます。再試行上限（`max_retries`）を超えた異常ジョブは自動的にデッドレターキュー（DLQ、`DeadLettered` 状態）へ移送されます。
+- **旧ワーカーの遅延 ACK 拒絶**: リース失効後に別ワーカーへ再貸出された場合、旧ワーカーが遅延して送った ACK は `TokenExpired`（エラーコード 23）で拒絶され、新ワーカーの成果物を保護します。
+- **大量ジョブ投入とスロット再利用**: 多数のジョブの投入・取得・ACK サイクルにおいて、完了したスロットを優先的に再利用し、インメモリ配列の無制限な伸長を防止します。
+- **ディスク枯渇時の振る舞い**: `sigil-db` 核の I/O 関門へ `act_fail_space`（ENOSPC）を注入し、WAL 同期失敗時に `Enqueued` 応答が返らず、トランザクションが安全にロールバックされ、再起動後も既存ジョブが破損なく保全されることを検証します。
+- **DoS 防御とプロトコル境界**: 1 MiB ペイロード上限（超過時 `PayloadTooLarge`）、1 MiB + 4 KiB フレーム長上限（超過時 `FrameTooLarge`）、同時接続数上限（`max_connections`）、I/O タイムアウト（低速接続切断）、および既定ループバック（`127.0.0.1`）待ち受けを検証します。
+
+### 公開前検証記録（G2）
+
+[ADR 0020](https://github.com/goodnasubi/sigil/blob/main/docs/decisions/0020-p1-security-addendum.md) 決定 3 の G2 関門に基づくセキュリティ検証記録、および G3 関門において所有者（goodnasubi）へ提示する確認項目を [`docs/pre-publish-record.md`](docs/pre-publish-record.md) に記録しています。
+
+### 検証
+
+```sh
+scripts/fetch-deps.sh
+cargo build --locked --manifest-path .deps/sigil-compiler/Cargo.toml --bin sigil
+scripts/test-stage4.sh
+```
+
+`KEEP_SCRATCH=1` を指定すると一時ディレクトリを保持できます。
+
