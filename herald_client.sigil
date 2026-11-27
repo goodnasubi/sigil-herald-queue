@@ -1,0 +1,224 @@
+module herald_client
+  targets server
+  trust none
+
+use herald_wire.Failure;
+use herald_wire.Leased;
+use herald_wire.QueueStats;
+use herald_wire.Request;
+use herald_wire.Response;
+use herald_wire.decode_response;
+use herald_wire.encode_request;
+use herald_wire.max_frame;
+
+// Typed client for the herald-queue TCP protocol (ADR 0066 decision 4.3). Other components import this module:
+//
+//   let mut client = connect(&host, port, 10000)?;
+//   let id = client.enqueue(&queue, payload, 0, 3)?;
+//   match client.dequeue(&queue, 30, 10)? { Some(job) => ..., None => ... }
+//   client.ack(&queue, job.id, &job.lease_token)?;
+//
+// Each call is one request and one response on the same connection. Calls never wait longer than io_timeout_ms,
+// except dequeue, which adds its wait_seconds on top (the server holds the request while it long-polls).
+
+pub struct Client {
+  conn: TcpClient,
+  io_timeout_ms: Int,
+}
+
+pub enum ClientError {
+  Io,
+  Timeout,
+  Protocol(Failure),
+  Server(Failure),
+}
+
+pub fn connect(host: &String, port: Int, io_timeout_ms: Int) -> Result<Client, ClientError>
+  intent "Open a connection to a herald-queue server."
+  requires 1 <= port && port <= 65535
+  ensures none
+  effects net.client, task.suspend
+{
+  if io_timeout_ms < 1 {
+    return Err(ClientError.Io);
+  }
+  return match net.connect(&host, port) {
+    Ok(conn) => Ok(Client { conn: conn, io_timeout_ms: io_timeout_ms }),
+    Err(error) => Err(ClientError.Io),
+  };
+}
+
+fn read_exact(conn: &mut TcpClient, count: Int) -> Result<Bytes, ClientError>
+  intent "Read exactly count bytes."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut out = Bytes.with_capacity(count);
+  while out.byte_len() < count {
+    let mut chunk = count - out.byte_len();
+    if chunk > 65536 {
+      chunk = 65536;
+    }
+    match conn.read(chunk) {
+      Ok(piece) => {
+        if piece.byte_len() == 0 {
+          return Err(ClientError.Io);
+        }
+        out.extend(&piece);
+      }
+      Err(error) => {
+        return Err(ClientError.Io);
+      }
+    }
+  }
+  return Ok(out);
+}
+
+fn read_response(conn: &mut TcpClient) -> Result<Response, ClientError>
+  intent "Read one response frame; the length is checked before the body is read."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let header = read_exact(&mut conn, 4)?;
+  let length = header.read_u32_be(0).unwrap_or(0);
+  if length < 2 || length > max_frame() {
+    return Err(ClientError.Protocol(Failure.Malformed));
+  }
+  let body = read_exact(&mut conn, length)?;
+  return match decode_response(&body) {
+    Ok(response) => Ok(response),
+    Err(failure) => Err(ClientError.Protocol(failure)),
+  };
+}
+
+fn failure_of(response: &Response) -> Option<Failure>
+  intent "The failure carried by an ERROR response, if it is one."
+  requires none
+  ensures none
+  effects none
+{
+  return match response {
+    Response.Failed(failure) => Some(failure.clone()),
+    _ => None,
+  };
+}
+
+fn exchange(client: &mut Client, request: &Request, wait_ms: Int) -> Result<Response, ClientError>
+  intent "Send one request and read its response, each within the timeout."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let frame = encode_request(&request);
+  let timeout_ms = client.io_timeout_ms;
+  let sent = task.timeout(timeout_ms, || client.conn.write_all(&frame));
+  match sent {
+    Some(written) => {
+      if written.is_err() {
+        return Err(ClientError.Io);
+      }
+    }
+    None => {
+      return Err(ClientError.Timeout);
+    }
+  }
+  let received = task.timeout(timeout_ms + wait_ms, || read_response(&mut client.conn));
+  match received {
+    Some(outcome) => {
+      let response = outcome?;
+      return match failure_of(&response) {
+        Some(failure) => Err(ClientError.Server(failure)),
+        None => Ok(response),
+      };
+    }
+    None => {
+      return Err(ClientError.Timeout);
+    }
+  }
+}
+
+fn unexpected() -> ClientError
+  intent "A well-formed response of the wrong kind for the request."
+  requires none
+  ensures none
+  effects none
+{
+  return ClientError.Protocol(Failure.Malformed);
+}
+
+impl Client {
+  pub fn ping(self: &mut Client) -> Result<Bool, ClientError>
+    intent "Check that the server answers."
+    requires none
+    ensures none
+    effects clock, net.client, task.spawn, task.suspend
+  {
+    return match exchange(&mut self, &Request.Ping, 0)? {
+      Response.Done => Ok(true),
+      _ => Err(unexpected()),
+    };
+  }
+
+  pub fn enqueue(self: &mut Client, queue: &String, payload: Bytes, delay_seconds: Int, max_retries: Int) -> Result<Int, ClientError>
+    intent "Add a job and return its id."
+    requires none
+    ensures none
+    effects clock, net.client, task.spawn, task.suspend
+  {
+    return match exchange(&mut self, &Request.Enqueue(queue.clone(), payload, delay_seconds, max_retries), 0)? {
+      Response.Enqueued(id) => Ok(id),
+      _ => Err(unexpected()),
+    };
+  }
+
+  pub fn dequeue(self: &mut Client, queue: &String, lease_seconds: Int, wait_seconds: Int) -> Result<Option<Leased>, ClientError>
+    intent "Lease the next job, waiting up to wait_seconds (at most 30) for one to arrive."
+    requires none
+    ensures none
+    effects clock, net.client, task.spawn, task.suspend
+  {
+    return match exchange(&mut self, &Request.Dequeue(queue.clone(), lease_seconds, wait_seconds), wait_seconds * 1000)? {
+      Response.Job(job) => Ok(Some(job)),
+      Response.NoJob => Ok(None),
+      _ => Err(unexpected()),
+    };
+  }
+
+  pub fn ack(self: &mut Client, queue: &String, job_id: Int, lease_token: &Bytes) -> Result<Bool, ClientError>
+    intent "Report a job as done."
+    requires none
+    ensures none
+    effects clock, net.client, task.spawn, task.suspend
+  {
+    return match exchange(&mut self, &Request.Ack(queue.clone(), job_id, lease_token.clone()), 0)? {
+      Response.Done => Ok(true),
+      _ => Err(unexpected()),
+    };
+  }
+
+  pub fn nack(self: &mut Client, queue: &String, job_id: Int, lease_token: &Bytes, delay_seconds: Int) -> Result<Bool, ClientError>
+    intent "Report a temporary failure; the job is retried after delay_seconds."
+    requires none
+    ensures none
+    effects clock, net.client, task.spawn, task.suspend
+  {
+    return match exchange(&mut self, &Request.Nack(queue.clone(), job_id, lease_token.clone(), delay_seconds), 0)? {
+      Response.Done => Ok(true),
+      _ => Err(unexpected()),
+    };
+  }
+
+  pub fn inspect(self: &mut Client, queue: &String) -> Result<QueueStats, ClientError>
+    intent "Read the per-state job counts of a queue."
+    requires none
+    ensures none
+    effects clock, net.client, task.spawn, task.suspend
+  {
+    return match exchange(&mut self, &Request.Inspect(queue.clone()), 0)? {
+      Response.Stats(stats) => Ok(stats),
+      _ => Err(unexpected()),
+    };
+  }
+}

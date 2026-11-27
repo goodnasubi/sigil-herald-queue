@@ -1,0 +1,626 @@
+module herald_wire
+  targets server
+  trust none
+
+// Versioned, length-prefixed binary protocol of ADR 0066 decision 4.2 (version 1).
+//
+// Frame: u32 length (big endian, counts the bytes after itself) | u8 version | u8 type | body.
+//   The length covers version, type and body, so it is at least 2 and at most max_frame().
+// Strings and byte strings carry a u16 or u32 length prefix; integers are big endian.
+//
+// Request types:  1 ENQUEUE, 2 DEQUEUE, 3 ACK, 4 NACK, 5 INSPECT, 6 PING.
+// Response types: 128 OK, 129 ENQUEUED, 130 JOB, 131 NO_JOB, 132 STATS, 255 ERROR.
+//
+// This module is pure: it only turns bytes into values and back, so it can be fuzzed without a socket.
+
+pub enum Failure {
+  Malformed,
+  UnsupportedVersion,
+  UnknownCommand,
+  FrameTooLarge,
+  InvalidQueueName,
+  PayloadTooLarge,
+  InvalidWait,
+  UnknownQueue,
+  InvalidDelay,
+  InvalidLease,
+  InvalidRetries,
+  InvalidTime,
+  DeadlineOverflow,
+  SequenceExhausted,
+  JobNotFound,
+  TokenExpired,
+  Storage,
+  Unknown(Int),
+}
+
+pub enum Request {
+  Enqueue(String, Bytes, Int, Int),
+  Dequeue(String, Int, Int),
+  Ack(String, Int, Bytes),
+  Nack(String, Int, Bytes, Int),
+  Inspect(String),
+  Ping,
+}
+
+pub struct QueueStats {
+  ready: Int,
+  leased: Int,
+  delayed: Int,
+  dead_lettered: Int,
+}
+
+pub struct Leased {
+  id: Int,
+  attempt: Int,
+  lease_token: Bytes,
+  payload: Bytes,
+}
+
+pub enum Response {
+  Done,
+  Enqueued(Int),
+  Job(Leased),
+  NoJob,
+  Stats(QueueStats),
+  Failed(Failure),
+}
+
+pub fn new_leased(id: Int, attempt: Int, lease_token: Bytes, payload: Bytes) -> Leased
+  intent "Build a leased job; struct literals cannot cross modules."
+  requires none
+  ensures none
+  effects none
+{
+  return Leased { id: id, attempt: attempt, lease_token: lease_token, payload: payload };
+}
+
+pub fn new_stats(ready: Int, leased: Int, delayed: Int, dead_lettered: Int) -> QueueStats
+  intent "Build queue statistics; struct literals cannot cross modules."
+  requires none
+  ensures none
+  effects none
+{
+  return QueueStats { ready: ready, leased: leased, delayed: delayed, dead_lettered: dead_lettered };
+}
+
+pub fn protocol_version() -> Int
+  intent "Return the only protocol version this implementation speaks."
+  requires none
+  ensures none
+  effects none
+{
+  return 1;
+}
+
+pub fn max_payload() -> Int
+  intent "Return the ADR 0066 payload limit in bytes (1 MiB)."
+  requires none
+  ensures none
+  effects none
+{
+  return 1048576;
+}
+
+pub fn max_frame() -> Int
+  intent "Return the frame length limit: 1 MiB payload plus 4 KiB of headers and metadata."
+  requires none
+  ensures none
+  effects none
+{
+  return 1052672;
+}
+
+pub fn max_queue_name() -> Int
+  intent "Return the longest queue name in bytes."
+  requires none
+  ensures none
+  effects none
+{
+  return 256;
+}
+
+pub fn max_wait_seconds() -> Int
+  intent "Return the longest long-poll wait in seconds."
+  requires none
+  ensures none
+  effects none
+{
+  return 30;
+}
+
+pub fn failure_code(failure: &Failure) -> Int
+  intent "Map a failure to its wire code."
+  requires none
+  ensures none
+  effects none
+{
+  return match failure {
+    Failure.Malformed => 1,
+    Failure.UnsupportedVersion => 2,
+    Failure.UnknownCommand => 3,
+    Failure.FrameTooLarge => 4,
+    Failure.InvalidQueueName => 5,
+    Failure.PayloadTooLarge => 6,
+    Failure.InvalidWait => 7,
+    Failure.UnknownQueue => 8,
+    Failure.InvalidDelay => 16,
+    Failure.InvalidLease => 17,
+    Failure.InvalidRetries => 18,
+    Failure.InvalidTime => 19,
+    Failure.DeadlineOverflow => 20,
+    Failure.SequenceExhausted => 21,
+    Failure.JobNotFound => 22,
+    Failure.TokenExpired => 23,
+    Failure.Storage => 32,
+    Failure.Unknown(code) => code,
+  };
+}
+
+pub fn failure_from_code(code: Int) -> Failure
+  intent "Map a wire code to a failure; codes this version does not know become Unknown."
+  requires none
+  ensures none
+  effects none
+{
+  if code == 1 {
+    return Failure.Malformed;
+  }
+  if code == 2 {
+    return Failure.UnsupportedVersion;
+  }
+  if code == 3 {
+    return Failure.UnknownCommand;
+  }
+  if code == 4 {
+    return Failure.FrameTooLarge;
+  }
+  if code == 5 {
+    return Failure.InvalidQueueName;
+  }
+  if code == 6 {
+    return Failure.PayloadTooLarge;
+  }
+  if code == 7 {
+    return Failure.InvalidWait;
+  }
+  if code == 8 {
+    return Failure.UnknownQueue;
+  }
+  if code == 16 {
+    return Failure.InvalidDelay;
+  }
+  if code == 17 {
+    return Failure.InvalidLease;
+  }
+  if code == 18 {
+    return Failure.InvalidRetries;
+  }
+  if code == 19 {
+    return Failure.InvalidTime;
+  }
+  if code == 20 {
+    return Failure.DeadlineOverflow;
+  }
+  if code == 21 {
+    return Failure.SequenceExhausted;
+  }
+  if code == 22 {
+    return Failure.JobNotFound;
+  }
+  if code == 23 {
+    return Failure.TokenExpired;
+  }
+  if code == 32 {
+    return Failure.Storage;
+  }
+  return Failure.Unknown(code);
+}
+
+struct Reader {
+  data: Bytes,
+  pos: Int,
+}
+
+fn new_reader(data: &Bytes, pos: Int) -> Reader
+  intent "Start reading a frame at the given offset."
+  requires none
+  ensures none
+  effects none
+{
+  return Reader { data: data.clone(), pos: pos };
+}
+
+fn remaining(reader: &Reader) -> Int
+  intent "Count the unread bytes."
+  requires none
+  ensures none
+  effects none
+{
+  return reader.data.byte_len() - reader.pos;
+}
+
+fn read_u8(reader: &mut Reader) -> Result<Int, Failure>
+  intent "Read one byte or fail with Malformed."
+  requires none
+  ensures none
+  effects none
+{
+  let value = reader.data.get(reader.pos).ok_or(Failure.Malformed)?;
+  reader.pos = reader.pos + 1;
+  return Ok(value);
+}
+
+fn read_u16(reader: &mut Reader) -> Result<Int, Failure>
+  intent "Read a big-endian u16 or fail with Malformed."
+  requires none
+  ensures none
+  effects none
+{
+  let high = read_u8(&mut reader)?;
+  let low = read_u8(&mut reader)?;
+  return Ok(high * 256 + low);
+}
+
+fn read_u32(reader: &mut Reader) -> Result<Int, Failure>
+  intent "Read a big-endian u32 or fail with Malformed."
+  requires none
+  ensures none
+  effects none
+{
+  let value = reader.data.read_u32_be(reader.pos).ok_or(Failure.Malformed)?;
+  reader.pos = reader.pos + 4;
+  return Ok(value);
+}
+
+fn read_u64(reader: &mut Reader) -> Result<Int, Failure>
+  intent "Read a big-endian u64 that fits in a non-negative Int, or fail with Malformed."
+  requires none
+  ensures none
+  effects none
+{
+  let high = read_u32(&mut reader)?;
+  let low = read_u32(&mut reader)?;
+  if high >= 2147483648 {
+    return Err(Failure.Malformed);
+  }
+  return Ok(high * 4294967296 + low);
+}
+
+fn read_bytes(reader: &mut Reader, count: Int) -> Result<Bytes, Failure>
+  intent "Read exactly count bytes or fail with Malformed."
+  requires none
+  ensures none
+  effects none
+{
+  if count < 0 || count > remaining(&reader) {
+    return Err(Failure.Malformed);
+  }
+  let start = reader.pos;
+  let out = reader.data.slice(start, start + count).map_err(|cause| Failure.Malformed)?;
+  reader.pos = start + count;
+  return Ok(out);
+}
+
+fn queue_name_char(c: Int) -> Bool
+  intent "Accept ASCII letters, digits, dot, dash and underscore."
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return true;
+  }
+  if c >= 65 && c <= 90 {
+    return true;
+  }
+  if c >= 97 && c <= 122 {
+    return true;
+  }
+  return c == 46 || c == 45 || c == 95;
+}
+
+pub fn valid_queue_name(name: &Bytes) -> Bool
+  intent "Check that a queue name is 1 to 256 bytes of [A-Za-z0-9._-]."
+  requires none
+  ensures none
+  effects none
+{
+  let count = name.byte_len();
+  if count < 1 || count > max_queue_name() {
+    return false;
+  }
+  let mut index = 0;
+  while index < count {
+    if !queue_name_char(name.get(index).unwrap_or(0)) {
+      return false;
+    }
+    index = index + 1;
+  }
+  return true;
+}
+
+fn read_queue_name(reader: &mut Reader) -> Result<String, Failure>
+  intent "Read a u16-prefixed queue name and validate it."
+  requires none
+  ensures none
+  effects none
+{
+  let count = read_u16(&mut reader)?;
+  if count < 1 || count > max_queue_name() {
+    return Err(Failure.InvalidQueueName);
+  }
+  let raw_name = read_bytes(&mut reader, count)?;
+  if !valid_queue_name(&raw_name) {
+    return Err(Failure.InvalidQueueName);
+  }
+  return raw_name.to_string_utf8().map_err(|cause| Failure.InvalidQueueName);
+}
+
+fn read_token(reader: &mut Reader) -> Result<Bytes, Failure>
+  intent "Read a u16-prefixed lease token of at most 256 bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let count = read_u16(&mut reader)?;
+  if count > 256 {
+    return Err(Failure.Malformed);
+  }
+  return read_bytes(&mut reader, count);
+}
+
+fn finish_reader(reader: &Reader) -> Result<Bool, Failure>
+  intent "Reject frames with bytes left over after the body."
+  requires none
+  ensures none
+  effects none
+{
+  if remaining(&reader) != 0 {
+    return Err(Failure.Malformed);
+  }
+  return Ok(true);
+}
+
+fn read_header(reader: &mut Reader) -> Result<Int, Failure>
+  intent "Check the frame size and version and return the type byte."
+  requires none
+  ensures none
+  effects none
+{
+  let size = remaining(&reader);
+  if size > max_frame() {
+    return Err(Failure.FrameTooLarge);
+  }
+  if size < 2 {
+    return Err(Failure.Malformed);
+  }
+  let version = read_u8(&mut reader)?;
+  if version != protocol_version() {
+    return Err(Failure.UnsupportedVersion);
+  }
+  return read_u8(&mut reader);
+}
+
+pub fn decode_request(frame: &Bytes) -> Result<Request, Failure>
+  intent "Parse the bytes after the length prefix into a request; never trusts any length it reads."
+  requires none
+  ensures none
+  effects none
+{
+  let mut reader = new_reader(&frame, 0);
+  let kind = read_header(&mut reader)?;
+  if kind == 1 {
+    let queue = read_queue_name(&mut reader)?;
+    let delay = read_u32(&mut reader)?;
+    let retries = read_u32(&mut reader)?;
+    let size = read_u32(&mut reader)?;
+    if size > max_payload() {
+      return Err(Failure.PayloadTooLarge);
+    }
+    let payload = read_bytes(&mut reader, size)?;
+    finish_reader(&reader)?;
+    return Ok(Request.Enqueue(queue, payload, delay, retries));
+  }
+  if kind == 2 {
+    let queue = read_queue_name(&mut reader)?;
+    let lease = read_u32(&mut reader)?;
+    let wait = read_u32(&mut reader)?;
+    finish_reader(&reader)?;
+    return Ok(Request.Dequeue(queue, lease, wait));
+  }
+  if kind == 3 {
+    let queue = read_queue_name(&mut reader)?;
+    let id = read_u64(&mut reader)?;
+    let token = read_token(&mut reader)?;
+    finish_reader(&reader)?;
+    return Ok(Request.Ack(queue, id, token));
+  }
+  if kind == 4 {
+    let queue = read_queue_name(&mut reader)?;
+    let id = read_u64(&mut reader)?;
+    let token = read_token(&mut reader)?;
+    let delay = read_u32(&mut reader)?;
+    finish_reader(&reader)?;
+    return Ok(Request.Nack(queue, id, token, delay));
+  }
+  if kind == 5 {
+    let queue = read_queue_name(&mut reader)?;
+    finish_reader(&reader)?;
+    return Ok(Request.Inspect(queue));
+  }
+  if kind == 6 {
+    finish_reader(&reader)?;
+    return Ok(Request.Ping);
+  }
+  return Err(Failure.UnknownCommand);
+}
+
+fn push_name(out: &mut Bytes, name: &String)
+  intent "Append a u16-prefixed string."
+  requires none
+  ensures none
+  effects none
+{
+  let raw_name = name.as_bytes();
+  out.push_u16_be(raw_name.byte_len());
+  out.extend(&raw_name);
+}
+
+fn push_token(out: &mut Bytes, token: &Bytes)
+  intent "Append a u16-prefixed byte string."
+  requires none
+  ensures none
+  effects none
+{
+  out.push_u16_be(token.byte_len());
+  out.extend(&token);
+}
+
+fn framed(kind: Int, body: &Bytes) -> Bytes
+  intent "Prefix a body with the length, version and type."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(body.byte_len() + 6);
+  out.push_u32_be(body.byte_len() + 2);
+  out.push(protocol_version());
+  out.push(kind);
+  out.extend(&body);
+  return out;
+}
+
+pub fn encode_request(request: &Request) -> Bytes
+  intent "Encode a request as a complete frame including the length prefix."
+  requires none
+  ensures none
+  effects none
+{
+  let mut body = Bytes.new();
+  let mut kind = 6;
+  match request {
+    Request.Enqueue(queue, payload, delay, retries) => {
+      kind = 1;
+      push_name(&mut body, &queue);
+      body.push_u32_be(delay);
+      body.push_u32_be(retries);
+      body.push_u32_be(payload.byte_len());
+      body.extend(&payload);
+    }
+    Request.Dequeue(queue, lease, wait) => {
+      kind = 2;
+      push_name(&mut body, &queue);
+      body.push_u32_be(lease);
+      body.push_u32_be(wait);
+    }
+    Request.Ack(queue, id, token) => {
+      kind = 3;
+      push_name(&mut body, &queue);
+      body.push_u64_be(id);
+      push_token(&mut body, &token);
+    }
+    Request.Nack(queue, id, token, delay) => {
+      kind = 4;
+      push_name(&mut body, &queue);
+      body.push_u64_be(id);
+      push_token(&mut body, &token);
+      body.push_u32_be(delay);
+    }
+    Request.Inspect(queue) => {
+      kind = 5;
+      push_name(&mut body, &queue);
+    }
+    Request.Ping => {}
+  }
+  return framed(kind, &body);
+}
+
+pub fn encode_response(response: &Response) -> Bytes
+  intent "Encode a response as a complete frame including the length prefix."
+  requires none
+  ensures none
+  effects none
+{
+  let mut body = Bytes.new();
+  let mut kind = 128;
+  match response {
+    Response.Done => {}
+    Response.Enqueued(id) => {
+      kind = 129;
+      body.push_u64_be(id);
+    }
+    Response.Job(job) => {
+      kind = 130;
+      body.push_u64_be(job.id);
+      body.push_u32_be(job.attempt);
+      push_token(&mut body, &job.lease_token);
+      body.push_u32_be(job.payload.byte_len());
+      body.extend(&job.payload);
+    }
+    Response.NoJob => {
+      kind = 131;
+    }
+    Response.Stats(stats) => {
+      kind = 132;
+      body.push_u64_be(stats.ready);
+      body.push_u64_be(stats.leased);
+      body.push_u64_be(stats.delayed);
+      body.push_u64_be(stats.dead_lettered);
+    }
+    Response.Failed(failure) => {
+      kind = 255;
+      body.push_u16_be(failure_code(&failure));
+    }
+  }
+  return framed(kind, &body);
+}
+
+pub fn decode_response(frame: &Bytes) -> Result<Response, Failure>
+  intent "Parse the bytes after the length prefix into a response."
+  requires none
+  ensures none
+  effects none
+{
+  let mut reader = new_reader(&frame, 0);
+  let kind = read_header(&mut reader)?;
+  if kind == 128 {
+    finish_reader(&reader)?;
+    return Ok(Response.Done);
+  }
+  if kind == 129 {
+    let id = read_u64(&mut reader)?;
+    finish_reader(&reader)?;
+    return Ok(Response.Enqueued(id));
+  }
+  if kind == 130 {
+    let id = read_u64(&mut reader)?;
+    let attempt = read_u32(&mut reader)?;
+    let token = read_token(&mut reader)?;
+    let size = read_u32(&mut reader)?;
+    if size > max_payload() {
+      return Err(Failure.PayloadTooLarge);
+    }
+    let payload = read_bytes(&mut reader, size)?;
+    finish_reader(&reader)?;
+    return Ok(Response.Job(Leased { id: id, attempt: attempt, lease_token: token, payload: payload }));
+  }
+  if kind == 131 {
+    finish_reader(&reader)?;
+    return Ok(Response.NoJob);
+  }
+  if kind == 132 {
+    let ready = read_u64(&mut reader)?;
+    let leased = read_u64(&mut reader)?;
+    let delayed = read_u64(&mut reader)?;
+    let dead = read_u64(&mut reader)?;
+    finish_reader(&reader)?;
+    return Ok(Response.Stats(QueueStats { ready: ready, leased: leased, delayed: delayed, dead_lettered: dead }));
+  }
+  if kind == 255 {
+    let code = read_u16(&mut reader)?;
+    finish_reader(&reader)?;
+    return Ok(Response.Failed(failure_from_code(code)));
+  }
+  return Err(Failure.UnknownCommand);
+}

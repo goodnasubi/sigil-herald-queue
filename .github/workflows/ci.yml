@@ -57,3 +57,28 @@ jobs:
           result="$("$test_binary")"
           echo "$result"
           test "$result" = 0
+
+  tcp:
+    name: TCP protocol and client (stage 3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      - name: Fetch the pinned compiler and sigil-db core
+        run: scripts/fetch-deps.sh
+
+      - name: Build the pinned Sigil compiler
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable build --locked --manifest-path .deps/sigil-compiler/Cargo.toml --bin sigil
+
+      - name: Wire codec, TCP server and client (evaluator and native)
+        run: scripts/test-tcp.sh

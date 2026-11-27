@@ -1,0 +1,633 @@
+module herald_tcp_test
+  targets server
+  trust none
+
+use herald_client.ClientError;
+use herald_client.connect;
+use herald_server.default_config;
+use herald_server.listen_on;
+use herald_server.open_hub;
+use herald_server.serve;
+use herald_server.share_hub;
+use herald_server.with_data_dir;
+use herald_server.with_limits;
+use herald_server.with_listen;
+use herald_server.with_queue;
+use herald_server.with_test_clock;
+use herald_wire.Response;
+use herald_wire.decode_response;
+use herald_wire.failure_code;
+use herald_wire.max_frame;
+use herald_wire.max_payload;
+use herald_wire_test.mutate;
+use herald_wire_test.next_random;
+use herald_wire_test.seed_frames;
+
+// Integration and defense tests over a real loopback socket. The server and the test clients run in one program:
+// task.race cancels the (endless) server as soon as the scenario returns. Queue time comes from a shared cell, so
+// leases and delays are driven without sleeping; only long polling and I/O timeouts use real time.
+// Exit value: 0 on success, otherwise the number of the failed check.
+
+fn host() -> String
+  intent "The loopback address every test uses."
+  requires none
+  ensures none
+  effects none
+{
+  return "127.0.0.1";
+}
+
+fn payload_of(count: Int, seed: Int) -> Bytes
+  intent "A deterministic binary payload that includes NUL and high bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(count);
+  let mut index = 0;
+  while index < count {
+    out.push(index * 7 + seed & 255);
+    index = index + 1;
+  }
+  return out;
+}
+
+fn server_failure(outcome: &Result<Bool, ClientError>) -> Int
+  intent "Wire code of the server failure inside a client result, or -1 for anything else."
+  requires none
+  ensures none
+  effects none
+{
+  return match outcome {
+    Err(ClientError.Server(failure)) => failure_code(&failure),
+    _ => -1,
+  };
+}
+
+fn flow_basics(port: Int, cell: &Atomic<Int>) -> Result<Bool, Int>
+  intent "ENQUEUE, DEQUEUE, ACK, NACK, INSPECT and PING work end to end through the client."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  let mut client = connect(&host(), port, 3000).map_err(|e| 100)?;
+  client.ping().map_err(|e| 101)?;
+  let first = client.enqueue(&"jobs", payload_of(10, 1), 0, 3).map_err(|e| 102)?;
+  let second = client.enqueue(&"jobs", payload_of(0, 2), 0, 0).map_err(|e| 103)?;
+  if second <= first {
+    return Err(104);
+  }
+  let stats = client.inspect(&"jobs").map_err(|e| 105)?;
+  if stats.ready != 2 || stats.leased != 0 || stats.delayed != 0 || stats.dead_lettered != 0 {
+    return Err(106);
+  }
+  let job = client.dequeue(&"jobs", 30, 0).map_err(|e| 107)?.ok_or(108)?;
+  if job.id != first || job.attempt != 0 || job.lease_token.byte_len() != 16 || job.payload != payload_of(10, 1) {
+    return Err(109);
+  }
+  let stats2 = client.inspect(&"jobs").map_err(|e| 110)?;
+  if stats2.ready != 1 || stats2.leased != 1 {
+    return Err(111);
+  }
+  // A wrong token, a wrong job id and a wrong queue are refused without closing the connection.
+  let mut bad_token = job.lease_token.clone();
+  let first_byte = bad_token.get(0).unwrap_or(0);
+  let _ = bad_token.set(0, 255 - first_byte);
+  if server_failure(&client.ack(&"jobs", job.id, &bad_token)) != 23 {
+    return Err(112);
+  }
+  if server_failure(&client.ack(&"jobs", 9999, &job.lease_token)) != 22 {
+    return Err(113);
+  }
+  if server_failure(&client.ack(&"missing", job.id, &job.lease_token)) != 8 {
+    return Err(114);
+  }
+  client.ack(&"jobs", job.id, &job.lease_token).map_err(|e| 115)?;
+  if server_failure(&client.ack(&"jobs", job.id, &job.lease_token)) != 22 {
+    return Err(116);
+  }
+  // max_retries 0: one NACK dead-letters the job.
+  let next = client.dequeue(&"jobs", 30, 0).map_err(|e| 117)?.ok_or(118)?;
+  if next.id != second {
+    return Err(119);
+  }
+  client.nack(&"jobs", next.id, &next.lease_token, 0).map_err(|e| 120)?;
+  let stats3 = client.inspect(&"jobs").map_err(|e| 121)?;
+  if stats3.ready != 0 || stats3.leased != 0 || stats3.dead_lettered != 1 {
+    return Err(122);
+  }
+  // NACK with a delay, then the clock moves past it.
+  let third = client.enqueue(&"other", payload_of(3, 3), 0, 3).map_err(|e| 123)?;
+  let leased = client.dequeue(&"other", 30, 0).map_err(|e| 124)?.ok_or(125)?;
+  client.nack(&"other", leased.id, &leased.lease_token, 5).map_err(|e| 126)?;
+  if client.dequeue(&"other", 30, 0).map_err(|e| 127)?.is_some() {
+    return Err(128);
+  }
+  let stats4 = client.inspect(&"other").map_err(|e| 129)?;
+  if stats4.delayed != 1 {
+    return Err(130);
+  }
+  cell.store(cell.load() + 6);
+  let again = client.dequeue(&"other", 30, 0).map_err(|e| 131)?.ok_or(132)?;
+  if again.id != third || again.attempt != 1 {
+    return Err(133);
+  }
+  // An expired lease is refused, and the job comes back as a failed delivery.
+  cell.store(cell.load() + 31);
+  if server_failure(&client.ack(&"other", again.id, &again.lease_token)) != 23 {
+    return Err(134);
+  }
+  let redelivered = client.dequeue(&"other", 30, 0).map_err(|e| 135)?.ok_or(136)?;
+  if redelivered.id != third || redelivered.attempt != 2 {
+    return Err(137);
+  }
+  client.ack(&"other", redelivered.id, &redelivered.lease_token).map_err(|e| 138)?;
+  // Delay and lease bounds come back as typed failures.
+  if server_failure(&client.enqueue(&"jobs", Bytes.new(), 86401, 3).map(|assigned| true)) != 16 {
+    return Err(139);
+  }
+  if server_failure(&client.dequeue(&"jobs", 0, 0).map(|found| true)) != 17 {
+    return Err(140);
+  }
+  if server_failure(&client.dequeue(&"jobs", 30, 31).map(|found| true)) != 7 {
+    return Err(141);
+  }
+  return Ok(true);
+}
+
+fn flow_payload_limit(port: Int) -> Result<Bool, Int>
+  intent "A 1 MiB payload crosses the wire both ways; one byte more is refused."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut client = connect(&host(), port, 5000).map_err(|e| 200)?;
+  let big = payload_of(max_payload(), 9);
+  let id = client.enqueue(&"jobs", big.clone(), 0, 3).map_err(|e| 201)?;
+  let job = client.dequeue(&"jobs", 30, 0).map_err(|e| 202)?.ok_or(203)?;
+  if job.id != id || job.payload != big {
+    return Err(204);
+  }
+  client.ack(&"jobs", job.id, &job.lease_token).map_err(|e| 205)?;
+  if server_failure(&client.enqueue(&"jobs", payload_of(max_payload() + 1, 9), 0, 3).map(|assigned| true)) != 6 {
+    return Err(206);
+  }
+  // The protocol error closes this connection; the server itself keeps serving others.
+  let mut other = connect(&host(), port, 3000).map_err(|e| 207)?;
+  other.ping().map_err(|e| 208)?;
+  return Ok(true);
+}
+
+fn producer(port: Int, delay_ms: Int) -> Int
+  intent "Wait, then enqueue one job from a second connection."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  task.sleep(delay_ms);
+  match connect(&host(), port, 3000) {
+    Ok(conn) => {
+      let mut client = conn;
+      return match client.enqueue(&"jobs", payload_of(4, 4), 0, 3) {
+        Ok(id) => id,
+        Err(e) => 0 - 1,
+      };
+    }
+    Err(e) => {
+      return 0 - 2;
+    }
+  }
+}
+
+fn flow_long_poll(port: Int) -> Result<Bool, Int>
+  intent "An empty DEQUEUE waits wait_seconds; a job enqueued meanwhile ends the wait early."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut client = connect(&host(), port, 3000).map_err(|e| 300)?;
+  let started = clock.unix_seconds().unwrap_or(0);
+  if client.dequeue(&"jobs", 30, 1).map_err(|e| 301)?.is_some() {
+    return Err(302);
+  }
+  let waited = clock.unix_seconds().unwrap_or(0) - started;
+  if waited < 1 || waited > 3 {
+    return Err(303);
+  }
+  // A producer enqueues after 300 ms while this connection long-polls for up to 10 s.
+  let outcome = task.scope(|scope| {
+    let handle = scope.spawn(move || producer(port, 300));
+    let begun = clock.unix_seconds().unwrap_or(0);
+    let got = client.dequeue(&"jobs", 30, 10);
+    let elapsed = clock.unix_seconds().unwrap_or(0) - begun;
+    let produced = handle.join();
+    if produced < 1 {
+      return 304;
+    }
+    match got {
+      Ok(Some(job)) => {
+        if job.id != produced || job.payload != payload_of(4, 4) {
+          return 305;
+        }
+      }
+      _ => {
+        return 306;
+      }
+    }
+    if elapsed > 2 {
+      return 307;
+    }
+    return 0;
+  });
+  if outcome != 0 {
+    return Err(outcome);
+  }
+  return Ok(true);
+}
+
+fn raw_header(length: Int, version: Int, kind: Int) -> Bytes
+  intent "A frame header: length prefix, version and type."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push_u32_be(length);
+  out.push(version);
+  out.push(kind);
+  return out;
+}
+
+fn read_n(conn: &mut TcpClient, count: Int) -> Result<Bytes, Int>
+  intent "Read exactly count bytes; Err(0) when the peer closes first."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut out = Bytes.new();
+  while out.byte_len() < count {
+    match conn.read(count - out.byte_len()) {
+      Ok(piece) => {
+        if piece.byte_len() == 0 {
+          return Err(0);
+        }
+        out.extend(&piece);
+      }
+      Err(e) => {
+        return Err(0);
+      }
+    }
+  }
+  return Ok(out);
+}
+
+fn read_failure(conn: &mut TcpClient) -> Int
+  intent "Read one ERROR frame and return its wire code; -1 if there is none."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let got = task.timeout(3000, || read_n(&mut conn, 4));
+  match got {
+    Some(Ok(header)) => {
+      let length = header.read_u32_be(0).unwrap_or(0);
+      if length < 2 || length > max_frame() {
+        return -1;
+      }
+      return match task.timeout(3000, || read_n(&mut conn, length)) {
+        Some(Ok(body)) => match decode_response(&body) {
+          Ok(Response.Failed(failure)) => failure_code(&failure),
+          _ => -1,
+        },
+        _ => -1,
+      };
+    }
+    _ => {
+      return -1;
+    }
+  }
+}
+
+fn closed_by_peer(conn: &mut TcpClient, limit_ms: Int) -> Bool
+  intent "True when the peer closes the connection (EOF or reset) within limit_ms."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return match task.timeout(limit_ms, || conn.read(1)) {
+    Some(Ok(piece)) => piece.byte_len() == 0,
+    Some(Err(e)) => true,
+    None => false,
+  };
+}
+
+fn send_raw(port: Int, bytes: &Bytes) -> Result<TcpClient, Int>
+  intent "Open a raw connection and write bytes to it."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut conn = net.connect(&host(), port).map_err(|e| 1)?;
+  match conn.write_all(&bytes) {
+    Ok(done) => {}
+    Err(e) => {
+      return Err(2);
+    }
+  }
+  return Ok(conn);
+}
+
+fn rejected(port: Int, bytes: &Bytes, expected: Int, code: Int) -> Result<Bool, Int>
+  intent "The server answers these bytes with one ERROR frame of the expected code and closes the connection."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut conn = send_raw(port, &bytes).map_err(|c| code)?;
+  if read_failure(&mut conn) != expected {
+    return Err(code + 1);
+  }
+  if !closed_by_peer(&mut conn, 3000) {
+    return Err(code + 2);
+  }
+  return Ok(true);
+}
+
+fn defense_frames(port: Int) -> Result<Bool, Int>
+  intent "Bad version, bad type, bad lengths and garbage are refused; the server keeps serving afterwards."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  rejected(port, &raw_header(2, 2, 6), 2, 400)?;
+  rejected(port, &raw_header(2, 0, 6), 2, 403)?;
+  rejected(port, &raw_header(2, 1, 99), 3, 406)?;
+  rejected(port, &raw_header(2, 1, 130), 3, 409)?;
+  rejected(port, &raw_header(0, 1, 6), 1, 412)?;
+  rejected(port, &raw_header(1, 1, 6), 1, 415)?;
+  // The length alone is enough to refuse: no body is sent and none is read.
+  let mut oversize = Bytes.new();
+  oversize.push_u32_be(max_frame() + 1);
+  rejected(port, &oversize, 4, 418)?;
+  let mut huge = Bytes.new();
+  huge.push_u32_be(4294967295);
+  rejected(port, &huge, 4, 421)?;
+  // Trailing bytes after a valid PING body are malformed.
+  let mut trailing = raw_header(3, 1, 6);
+  trailing.push(0);
+  rejected(port, &trailing, 1, 424)?;
+  // A body that lies about an inner length.
+  let mut lie = raw_header(0, 1, 1);
+  lie.push_u16_be(4);
+  lie.extend(&"jobs".as_bytes());
+  lie.push_u32_be(0);
+  lie.push_u32_be(3);
+  lie.push_u32_be(1000);
+  let mut framed = Bytes.new();
+  framed.push_u32_be(lie.byte_len() - 4);
+  framed.extend(&lie.slice(4, lie.byte_len()).unwrap_or(Bytes.new()));
+  rejected(port, &framed, 1, 427)?;
+  // Pure noise.
+  rejected(port, &payload_of(64, 5), 4, 430)?;
+  // Still alive.
+  let mut client = connect(&host(), port, 3000).map_err(|e| 433)?;
+  client.ping().map_err(|e| 434)?;
+  return Ok(true);
+}
+
+fn defense_slow(port: Int) -> Result<Bool, Int>
+  intent "A client that stalls mid-frame, or sends nothing, is cut off by the I/O timeout (set to 300 ms here)."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  // Half a header, then silence.
+  let mut half = Bytes.new();
+  half.push(0);
+  half.push(0);
+  let mut stalled = send_raw(port, &half).map_err(|c| 500)?;
+  if !closed_by_peer(&mut stalled, 3000) {
+    return Err(501);
+  }
+  // A full header promising a body that never comes.
+  let mut promise = Bytes.new();
+  promise.push_u32_be(100);
+  promise.push(1);
+  let mut waiting = send_raw(port, &promise).map_err(|c| 502)?;
+  if !closed_by_peer(&mut waiting, 3000) {
+    return Err(503);
+  }
+  // Nothing at all.
+  let mut idle = send_raw(port, &Bytes.new()).map_err(|c| 504)?;
+  if !closed_by_peer(&mut idle, 3000) {
+    return Err(505);
+  }
+  // A connection that closes mid-frame leaves the server unharmed.
+  let mut cut = send_raw(port, &half).map_err(|c| 506)?;
+  let mut client = connect(&host(), port, 3000).map_err(|e| 507)?;
+  client.ping().map_err(|e| 508)?;
+  return Ok(true);
+}
+
+fn defense_connection_cap(port: Int) -> Result<Bool, Int>
+  intent "With max_connections = 2, a third connection is not served until one of the first two goes away."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut first = connect(&host(), port, 5000).map_err(|e| 600)?;
+  first.ping().map_err(|e| 601)?;
+  let mut second = connect(&host(), port, 5000).map_err(|e| 602)?;
+  second.ping().map_err(|e| 603)?;
+  // The third connects (the kernel completes the handshake) and sends PING, but nobody answers it.
+  let mut third = send_raw(port, &ping_frame()).map_err(|c| 604)?;
+  match task.timeout(150, || read_n(&mut third, 4)) {
+    None => {}
+    Some(answer) => {
+      return Err(605);
+    }
+  }
+  // Free one slot (here by letting the idle timeout of 1500 ms close the first two), then the third is served.
+  match task.timeout(5000, || read_n(&mut third, 4)) {
+    Some(Ok(header)) => {
+      if header.read_u32_be(0).unwrap_or(0) != 2 {
+        return Err(606);
+      }
+    }
+    _ => {
+      return Err(607);
+    }
+  }
+  return Ok(true);
+}
+
+fn fuzz_live(port: Int) -> Result<Bool, Int>
+  intent "Fire mutated request frames at the live server, one connection each, then check the server still answers."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let seeds = seed_frames();
+  let mut rng = 987654;
+  let mut round = 0;
+  while round < 240 {
+    rng = next_random(rng);
+    let pick = (rng >> 8) % 6;
+    rng = next_random(rng);
+    let mut body = Bytes.new();
+    match seeds.get(pick) {
+      Some(seed_frame) => {
+        body = mutate(&seed_frame.slice(4, seed_frame.byte_len()).unwrap_or(Bytes.new()), rng);
+      }
+      None => {}
+    }
+    let mut frame = Bytes.new();
+    frame.push_u32_be(body.byte_len());
+    frame.extend(&body);
+    let mut conn = send_raw(port, &frame).map_err(|c| 800)?;
+    // The server either answers and keeps the connection, or answers with an error and closes it. Either way it
+    // must not hang: read the first response frame (or EOF) within a bound.
+    match task.timeout(2000, || read_n(&mut conn, 4)) {
+      Some(outcome) => {}
+      None => {
+        // Only a DEQUEUE may legitimately keep the connection waiting (it long-polls an empty queue).
+        if body.get(1).unwrap_or(0) != 2 {
+          return Err(801);
+        }
+      }
+    }
+    round = round + 1;
+  }
+  let mut client = connect(&host(), port, 3000).map_err(|e| 802)?;
+  client.ping().map_err(|e| 803)?;
+  return Ok(true);
+}
+
+fn ping_frame() -> Bytes
+  intent "A complete PING request frame."
+  requires none
+  ensures none
+  effects none
+{
+  return raw_header(2, 1, 6);
+}
+
+fn persistent_flow(port: Int) -> Result<Bool, Int>
+  intent "The same protocol works when the queues are sigil-db databases."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut client = connect(&host(), port, 5000).map_err(|e| 700)?;
+  let id = client.enqueue(&"jobs", payload_of(20, 6), 0, 3).map_err(|e| 701)?;
+  let job = client.dequeue(&"jobs", 30, 0).map_err(|e| 702)?.ok_or(703)?;
+  if job.id != id || job.payload != payload_of(20, 6) {
+    return Err(704);
+  }
+  client.ack(&"jobs", job.id, &job.lease_token).map_err(|e| 705)?;
+  let stats = client.inspect(&"jobs").map_err(|e| 706)?;
+  if stats.ready != 0 || stats.leased != 0 {
+    return Err(707);
+  }
+  return Ok(true);
+}
+
+fn scenario(port: Int, which: Int, cell: Atomic<Int>) -> Int
+  intent "Run one scenario and return 0 or its failure code."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  let outcome = match which {
+    1 => flow_basics(port, &cell),
+    2 => flow_payload_limit(port),
+    3 => flow_long_poll(port),
+    4 => defense_frames(port),
+    5 => defense_slow(port),
+    6 => defense_connection_cap(port),
+    8 => fuzz_live(port),
+    _ => persistent_flow(port),
+  };
+  return match outcome {
+    Ok(done) => 0,
+    Err(code) => code,
+  };
+}
+
+fn harness(which: Int, max_connections: Int, io_timeout_ms: Int, data_dir: Option<String>) -> Int
+  intent "Start a server on an ephemeral loopback port, run one scenario against it, then cancel the server."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let cell = Atomic.new(1000000);
+  let mut config = with_test_clock(with_limits(with_listen(with_queue(with_queue(default_config(), "jobs"), "other"), "127.0.0.1", 0), max_connections, io_timeout_ms, 10), cell.clone());
+  match data_dir {
+    Some(dir) => {
+      config = with_data_dir(config, dir);
+    }
+    None => {}
+  }
+  match open_hub(config) {
+    Ok(hub) => {
+      match listen_on(&hub.config) {
+        Ok(listener) => {
+          let port = listener.local_port();
+          let shared = share_hub(hub);
+          let mut gs = List.new();
+          gs.push(move || scenario(port, which, cell.clone()));
+          gs.push(move || serve(&listener, &shared));
+          return task.race(gs);
+        }
+        Err(e) => {
+          return 8001;
+        }
+      }
+    }
+    Err(e) => {
+      return 8002;
+    }
+  }
+}
+
+pub fn run(which: Int) -> Int
+  intent "Run scenario number which (1 basics, 2 payload limit, 3 long poll, 4 bad frames, 5 slow clients, 6 connection cap, 7 persistent, 8 live fuzz)."
+  requires none
+  ensures none
+  effects clock, env, fs, net.server, task
+{
+  if which == 5 {
+    return harness(5, 8, 300, None);
+  }
+  if which == 6 {
+    return harness(6, 2, 1500, None);
+  }
+  if which == 8 {
+    return harness(8, 64, 300, None);
+  }
+  if which == 7 {
+    let dir = env.get(&"HERALD_QUEUE_TEST_DIR").unwrap_or("");
+    if dir == "" {
+      return 8003;
+    }
+    return harness(7, 8, 10000, Some(dir));
+  }
+  return harness(which, 8, 10000, None);
+}
+
+pub fn main() -> Int
+  intent "Return zero on success or the number of the failed check."
+  requires none
+  ensures none
+  effects clock, env, fs, net.server, task
+{
+  let mut which = 1;
+  while which <= 8 {
+    let code = run(which);
+    if code != 0 {
+      return code;
+    }
+    which = which + 1;
+  }
+  return 0;
+}

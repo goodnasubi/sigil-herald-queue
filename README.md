@@ -48,3 +48,39 @@ scripts/test-persistence.sh
 ```
 
 既に用意したコンパイラと核を使う場合は、絶対パスを `SIGIL` と `SIGIL_DB_CORE` に指定できます。
+
+## TCP プロトコルと Sigil クライアント（第3段）
+
+`herald_wire`（バイナリ符号化）、`herald_server`（TCP サーバー）、`herald_client`（型付きクライアント）が ADR 0066 の決定 5 を実装します。
+
+### プロトコル v1
+
+フレームは `u32 長さ（ビッグエンディアン）| バージョン(1) | 型 | 本文` です。長さはバージョン以降のバイト数で、上限は 1 MiB のペイロード + 4 KiB = 1,052,672 バイトです。サーバーは長さを確認してから本文を読み、超過や未知のバージョン・型は ERROR フレーム 1 つを返して接続を閉じます。
+
+- 要求の型: 1 ENQUEUE、2 DEQUEUE、3 ACK、4 NACK、5 INSPECT、6 PING
+- 応答の型: 128 DONE、129 ENQUEUED、130 JOB、131 NO_JOB、132 STATS、255 ERROR
+- キュー名は 1〜256 バイトで、サーバー起動時に設定した固定の集合から選びます。未知のキューは `UnknownQueue` を返します。
+- DEQUEUE の `wait_seconds`（0〜30）はロングポーリングです。ジョブが無い間は `poll_ms`（既定 20 ms）ごとに再確認し、投入があれば残り時間を待たずに返します。30 を超える値は `InvalidWait` です。
+
+サーバーの既定は `127.0.0.1:7480` で、同時接続数 64、読み書きの期限は 1 フレームあたり 10,000 ms です。上限を超える接続は閉じられ、期限を過ぎた接続は切断されます。`with_listen`・`with_limits`・`with_data_dir`（永続化）で変更できます。
+
+### クライアント
+
+```
+let mut client = connect(&host, 7480, 10000)?;
+let id = client.enqueue(&queue, payload, 0, 3)?;
+match client.dequeue(&queue, 30, 10)? { Some(job) => ..., None => ... }
+client.ack(&queue, job.id, &job.lease_token)?;
+```
+
+`ping`・`enqueue`・`dequeue`・`ack`・`nack`・`inspect` を持ち、エラーは `ClientError`（`Io`・`Timeout`・`Protocol`・`Server`）で返ります。
+
+### 検証
+
+```sh
+scripts/fetch-deps.sh
+cargo build --locked --manifest-path .deps/sigil-compiler/Cargo.toml --bin sigil
+scripts/test-tcp.sh
+```
+
+`herald_wire_test.sigil` は符号化の往復・拒否・上限と、変異フレームのファジング（受理したフレームは再符号化で元と一致する性質を検査）を行います。`herald_tcp_test.sigil` はループバックでサーバーとクライアントを動かし、基本操作・1 MiB ペイロード・ロングポーリング・不正フレーム・低速接続・接続数上限・永続モード・変異フレーム 240 件の実接続ファジングを検査します。

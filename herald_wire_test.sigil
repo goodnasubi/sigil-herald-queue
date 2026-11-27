@@ -1,0 +1,554 @@
+module herald_wire_test
+  targets server
+  trust none
+
+use herald_wire.Failure;
+use herald_wire.Request;
+use herald_wire.Response;
+use herald_wire.decode_request;
+use herald_wire.decode_response;
+use herald_wire.encode_request;
+use herald_wire.encode_response;
+use herald_wire.failure_code;
+use herald_wire.failure_from_code;
+use herald_wire.max_frame;
+use herald_wire.max_payload;
+use herald_wire.new_leased;
+use herald_wire.new_stats;
+
+// Pure codec tests: round trips, rejections, and a deterministic fuzz run.
+// Exit value: 0 on success, otherwise the number of the failed check.
+
+pub fn body_of(frame: &Bytes) -> Bytes
+  intent "Drop the 4-byte length prefix of a complete frame."
+  requires none
+  ensures none
+  effects none
+{
+  return frame.slice(4, frame.byte_len()).unwrap_or(Bytes.new());
+}
+
+fn bytes1(a: Int) -> Bytes
+  intent "A one-byte string."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push(a);
+  return out;
+}
+
+fn bytes2(a: Int, b: Int) -> Bytes
+  intent "A two-byte string."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = bytes1(a);
+  out.push(b);
+  return out;
+}
+
+fn bytes3(a: Int, b: Int, c: Int) -> Bytes
+  intent "A three-byte string."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = bytes2(a, b);
+  out.push(c);
+  return out;
+}
+
+fn sample_payload() -> Bytes
+  intent "A payload with NUL and high bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = bytes3(0, 1, 2);
+  out.push(255);
+  out.push(254);
+  out.push(0);
+  out.push(7);
+  return out;
+}
+
+fn filled(count: Int, value: Int) -> Bytes
+  intent "Build a byte string of one repeated value."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(count);
+  let mut index = 0;
+  while index < count {
+    out.push(value);
+    index = index + 1;
+  }
+  return out;
+}
+
+fn token16() -> Bytes
+  intent "A 16-byte lease token with distinct bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut index = 0;
+  while index < 16 {
+    out.push(index * 15);
+    index = index + 1;
+  }
+  return out;
+}
+
+fn request_round_trip(request: &Request, code: Int) -> Result<Bool, Int>
+  intent "A request must decode back to the same bytes it was encoded from."
+  requires none
+  ensures none
+  effects none
+{
+  let frame = encode_request(&request);
+  let length = frame.read_u32_be(0).ok_or(code)?;
+  if length != frame.byte_len() - 4 {
+    return Err(code);
+  }
+  let body = body_of(&frame);
+  let decoded = decode_request(&body).map_err(|e| code)?;
+  let again = encode_request(&decoded);
+  if again != frame {
+    return Err(code + 1);
+  }
+  return Ok(true);
+}
+
+fn response_round_trip(response: &Response, code: Int) -> Result<Bool, Int>
+  intent "A response must decode back to the same bytes it was encoded from."
+  requires none
+  ensures none
+  effects none
+{
+  let frame = encode_response(&response);
+  let body = body_of(&frame);
+  let decoded = decode_response(&body).map_err(|e| code)?;
+  let again = encode_response(&decoded);
+  if again != frame {
+    return Err(code + 1);
+  }
+  return Ok(true);
+}
+
+fn round_trips() -> Result<Bool, Int>
+  intent "All six requests and all response kinds survive a round trip."
+  requires none
+  ensures none
+  effects none
+{
+  let payload = sample_payload();
+  request_round_trip(&Request.Enqueue("mail.outgoing-1_A", payload.clone(), 86400, 3), 100)?;
+  request_round_trip(&Request.Enqueue("q", Bytes.new(), 0, 4294967295), 102)?;
+  request_round_trip(&Request.Dequeue("jobs", 30, 30), 104)?;
+  request_round_trip(&Request.Ack("jobs", 9007199254740993, token16()), 106)?;
+  request_round_trip(&Request.Nack("jobs", 1, token16(), 5), 108)?;
+  request_round_trip(&Request.Inspect("jobs"), 110)?;
+  request_round_trip(&Request.Ping, 112)?;
+  response_round_trip(&Response.Done, 120)?;
+  response_round_trip(&Response.Enqueued(42), 122)?;
+  response_round_trip(&Response.Job(new_leased(7, 2, token16(), payload.clone())), 124)?;
+  response_round_trip(&Response.NoJob, 126)?;
+  response_round_trip(&Response.Stats(new_stats(1, 2, 3, 4)), 128)?;
+  response_round_trip(&Response.Failed(Failure.TokenExpired), 130)?;
+  response_round_trip(&Response.Failed(Failure.Unknown(999)), 132)?;
+  return Ok(true);
+}
+
+fn failure_codes() -> Result<Bool, Int>
+  intent "Every failure maps to its own code and back."
+  requires none
+  ensures none
+  effects none
+{
+  let mut code = 0;
+  while code < 64 {
+    let failure = failure_from_code(code);
+    if failure_code(&failure) != code {
+      return Err(150 + code);
+    }
+    code = code + 1;
+  }
+  return Ok(true);
+}
+
+fn expect_request_error(frame: &Bytes, code: Int) -> Result<Bool, Int>
+  intent "Decoding this frame body must fail."
+  requires none
+  ensures none
+  effects none
+{
+  return match decode_request(&frame) {
+    Ok(_) => Err(code),
+    Err(_) => Ok(true),
+  };
+}
+
+fn request_failure(frame: &Bytes) -> Int
+  intent "Return the wire code of the failure, or -1 when decoding succeeds."
+  requires none
+  ensures none
+  effects none
+{
+  return match decode_request(&frame) {
+    Ok(_) => -1,
+    Err(failure) => failure_code(&failure),
+  };
+}
+
+fn ping_with(version: Int, kind: Int) -> Bytes
+  intent "A header-only frame body with the given version and type."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push(version);
+  out.push(kind);
+  return out;
+}
+
+fn rejections() -> Result<Bool, Int>
+  intent "Bad versions, types, sizes, names and lengths are refused with the right code."
+  requires none
+  ensures none
+  effects none
+{
+  if request_failure(&ping_with(1, 6)) != -1 {
+    return Err(200);
+  }
+  if request_failure(&ping_with(0, 6)) != 2 || request_failure(&ping_with(2, 6)) != 2 || request_failure(&ping_with(255, 6)) != 2 {
+    return Err(201);
+  }
+  if request_failure(&ping_with(1, 0)) != 3 || request_failure(&ping_with(1, 7)) != 3 || request_failure(&ping_with(1, 128)) != 3 {
+    return Err(202);
+  }
+  if request_failure(&Bytes.new()) != 1 || request_failure(&bytes1(1)) != 1 {
+    return Err(203);
+  }
+  let mut trailing = ping_with(1, 6);
+  trailing.push(0);
+  if request_failure(&trailing) != 1 {
+    return Err(204);
+  }
+  if request_failure(&filled(max_frame() + 1, 1)) != 4 {
+    return Err(205);
+  }
+  let good = body_of(&encode_request(&Request.Enqueue("jobs", bytes3(1, 2, 3), 0, 3)));
+  let mut cut = 0;
+  while cut < good.byte_len() {
+    let truncated = good.slice(0, cut).unwrap_or(Bytes.new());
+    if request_failure(&truncated) < 1 {
+      return Err(206);
+    }
+    cut = cut + 1;
+  }
+  // queue name: empty, too long, and outside the allowed alphabet
+  let empty_name = body_of(&encode_request(&Request.Inspect("x")));
+  let mut zero_len = ping_with(1, 5);
+  zero_len.push_u16_be(0);
+  if request_failure(&zero_len) != 5 {
+    return Err(207);
+  }
+  let mut long_len = ping_with(1, 5);
+  long_len.push_u16_be(257);
+  long_len.extend(&filled(257, 97));
+  if request_failure(&long_len) != 5 {
+    return Err(208);
+  }
+  let mut slash = ping_with(1, 5);
+  slash.push_u16_be(3);
+  slash.extend(&bytes3(97, 47, 98));
+  if request_failure(&slash) != 5 {
+    return Err(209);
+  }
+  let mut nul = ping_with(1, 5);
+  nul.push_u16_be(2);
+  nul.extend(&bytes2(97, 0));
+  if request_failure(&nul) != 5 {
+    return Err(210);
+  }
+  if request_failure(&empty_name) != -1 {
+    return Err(211);
+  }
+  // a payload length that promises more than the frame holds, and more than the limit
+  let mut lie = ping_with(1, 1);
+  lie.push_u16_be(1);
+  lie.push(97);
+  lie.push_u32_be(0);
+  lie.push_u32_be(3);
+  lie.push_u32_be(1000);
+  lie.extend(&bytes3(1, 2, 3));
+  if request_failure(&lie) != 1 {
+    return Err(212);
+  }
+  let mut huge = ping_with(1, 1);
+  huge.push_u16_be(1);
+  huge.push(97);
+  huge.push_u32_be(0);
+  huge.push_u32_be(3);
+  huge.push_u32_be(max_payload() + 1);
+  if request_failure(&huge) != 6 {
+    return Err(213);
+  }
+  let mut absurd = ping_with(1, 1);
+  absurd.push_u16_be(1);
+  absurd.push(97);
+  absurd.push_u32_be(0);
+  absurd.push_u32_be(3);
+  absurd.push_u32_be(4294967295);
+  if request_failure(&absurd) != 6 {
+    return Err(214);
+  }
+  // a job id with the top bit set cannot be a job id
+  let mut negative = ping_with(1, 3);
+  negative.push_u16_be(1);
+  negative.push(97);
+  negative.push_u64_be(9223372036854775807);
+  negative.push_u32_be(0);
+  negative.push_u32_be(0);
+  if request_failure(&negative) != 1 {
+    return Err(215);
+  }
+  return Ok(true);
+}
+
+fn limits() -> Result<Bool, Int>
+  intent "A maximum-size ENQUEUE with the longest queue name fits the frame limit and decodes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut name = Bytes.new();
+  let mut index = 0;
+  while index < 256 {
+    name.push(97);
+    index = index + 1;
+  }
+  let queue = name.to_string_utf8().map_err(|e| 400)?;
+  let frame = encode_request(&Request.Enqueue(queue, filled(max_payload(), 7), 86400, 3));
+  if frame.byte_len() - 4 > max_frame() {
+    return Err(401);
+  }
+  let decoded = decode_request(&body_of(&frame)).map_err(|e| 402)?;
+  match decoded {
+    Request.Enqueue(q, payload, delay, retries) => {
+      if payload.byte_len() != max_payload() || delay != 86400 || retries != 3 || q.as_bytes().byte_len() != 256 {
+        return Err(403);
+      }
+    }
+    _ => {
+      return Err(404);
+    }
+  }
+  return Ok(true);
+}
+
+pub fn next_random(rng: Int) -> Int
+  intent "A 31-bit linear congruential step (no overflow in 64 bits)."
+  requires none
+  ensures none
+  effects none
+{
+  return rng * 1103515245 + 12345 & 2147483647;
+}
+
+pub fn mutate(frame: &Bytes, seed: Int) -> Bytes
+  intent "Derive a hostile variant of a frame: flips, truncation, extension or random bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut rng = next_random(seed);
+  let mode = (rng >> 8) % 6;
+  let mut out = Bytes.new();
+  if mode == 0 {
+    // random bytes of random length
+    rng = next_random(rng);
+    let count = (rng >> 8) % 64;
+    let mut index = 0;
+    while index < count {
+      rng = next_random(rng);
+      out.push(rng >> 8 & 255);
+      index = index + 1;
+    }
+    return out;
+  }
+  let count = frame.byte_len();
+  let mut index = 0;
+  while index < count {
+    rng = next_random(rng);
+    let mut value = frame.get(index).unwrap_or(0);
+    if mode == 1 && (rng >> 8) % 8 == 0 {
+      value = rng >> 16 & 255;
+    }
+    if mode == 2 && (rng >> 8) % 16 == 0 {
+      value = value ^ 1 << (rng >> 16) % 8;
+    }
+    out.push(value);
+    index = index + 1;
+  }
+  rng = next_random(rng);
+  if mode == 3 && out.byte_len() > 0 {
+    return out.slice(0, (rng >> 8) % out.byte_len()).unwrap_or(Bytes.new());
+  }
+  if mode == 4 {
+    out.push(rng >> 8 & 255);
+    return out;
+  }
+  if mode == 5 && out.byte_len() > 0 {
+    let mut flipped = out.clone();
+    let _ = flipped.set((rng >> 8) % out.byte_len(), 255);
+    return flipped;
+  }
+  return out;
+}
+
+pub fn seed_frames() -> List<Bytes>
+  intent "Valid frames of every kind, used as mutation seeds."
+  requires none
+  ensures none
+  effects none
+{
+  let payload = sample_payload();
+  let mut out = List.new();
+  out.push(encode_request(&Request.Enqueue("jobs", payload.clone(), 5, 3)));
+  out.push(encode_request(&Request.Dequeue("jobs", 30, 10)));
+  out.push(encode_request(&Request.Ack("jobs", 12, token16())));
+  out.push(encode_request(&Request.Nack("jobs", 12, token16(), 5)));
+  out.push(encode_request(&Request.Inspect("jobs")));
+  out.push(encode_request(&Request.Ping));
+  out.push(encode_response(&Response.Done));
+  out.push(encode_response(&Response.Enqueued(9)));
+  out.push(encode_response(&Response.Job(new_leased(7, 2, token16(), payload.clone()))));
+  out.push(encode_response(&Response.NoJob));
+  out.push(encode_response(&Response.Stats(new_stats(1, 2, 3, 4))));
+  out.push(encode_response(&Response.Failed(Failure.JobNotFound)));
+  return out;
+}
+
+fn fuzz_one(candidate: &Bytes, code: Int) -> Result<Int, Int>
+  intent "Decode a hostile frame as request and as response. Returns how many decodes succeeded; accepted frames must re-encode to the same bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut accepted = 0;
+  match decode_request(&candidate) {
+    Ok(request) => {
+      accepted = accepted + 1;
+      let again = encode_request(&request);
+      if body_of(&again) != candidate.clone() {
+        return Err(code);
+      }
+    }
+    Err(_) => {}
+  }
+  match decode_response(&candidate) {
+    Ok(response) => {
+      accepted = accepted + 1;
+      let again = encode_response(&response);
+      if body_of(&again) != candidate.clone() {
+        return Err(code + 1);
+      }
+    }
+    Err(_) => {}
+  }
+  return Ok(accepted);
+}
+
+pub fn fuzz(rounds: Int, seed: Int) -> Int
+  intent "Run rounds mutated frames through both decoders. Returns accepted-decode count, or a negative failure code."
+  requires none
+  ensures none
+  effects none
+{
+  let seeds = seed_frames();
+  let mut rng = seed;
+  let mut round = 0;
+  let mut accepted = 0;
+  while round < rounds {
+    rng = next_random(rng);
+    let pick = (rng >> 8) % seeds.len();
+    rng = next_random(rng);
+    let mut hostile = Bytes.new();
+    match seeds.get(pick) {
+      Some(seed_frame) => {
+        hostile = mutate(&body_of(&seed_frame), rng);
+      }
+      None => {}
+    }
+    match fuzz_one(&hostile, 300) {
+      Ok(count) => {
+        accepted = accepted + count;
+      }
+      Err(code) => {
+        return 0 - code;
+      }
+    }
+    round = round + 1;
+  }
+  return accepted;
+}
+
+fn fuzz_check() -> Result<Bool, Int>
+  intent "The fuzz run must neither crash nor hang, and every accepted frame must re-encode identically."
+  requires none
+  ensures none
+  effects none
+{
+  let outcome = fuzz(20000, 12345);
+  if outcome < 0 {
+    return Err(0 - outcome);
+  }
+  return Ok(true);
+}
+
+pub fn main() -> Int
+  intent "Return zero on success or the number of the failed check."
+  requires none
+  ensures none
+  effects none
+{
+  match round_trips() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match failure_codes() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match rejections() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match limits() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match fuzz_check() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  return 0;
+}

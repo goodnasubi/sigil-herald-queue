@@ -43,6 +43,13 @@ pub struct Slot {
   job: Option<Job>,
 }
 
+pub struct Counts {
+  ready: Int,
+  leased: Int,
+  delayed: Int,
+  dead_lettered: Int,
+}
+
 pub struct Queue {
   slots: List<Slot>,
   next_job_id: Int,
@@ -397,6 +404,48 @@ pub fn inspect(queue: &mut Queue, now: Int, id: Int) -> Result<Option<Job>, Queu
     Some(slot) => Ok(slot.job.clone()),
     None => Ok(None),
   };
+}
+
+pub fn counts(queue: &mut Queue, now: Int) -> Result<Counts, QueueError>
+  intent "Count retained jobs by state after advancing the clock (the INSPECT statistics of ADR 0066 decision 4)."
+  requires none
+  ensures none
+  effects none
+{
+  advance(&mut queue, now)?;
+  let mut ready = 0;
+  let mut leased = 0;
+  let mut delayed = 0;
+  let mut dead_lettered = 0;
+  let mut index = 0;
+  while index < queue.slots.len() {
+    match queue.slots.get(index) {
+      Some(slot) => {
+        match slot.job {
+          Some(job) => {
+            match job.state {
+              JobState.Ready => {
+                ready = ready + 1;
+              }
+              JobState.Leased(expires_at, token) => {
+                leased = leased + 1;
+              }
+              JobState.Delayed(visible_at) => {
+                delayed = delayed + 1;
+              }
+              JobState.DeadLettered => {
+                dead_lettered = dead_lettered + 1;
+              }
+            }
+          }
+          None => {}
+        }
+      }
+      None => {}
+    }
+    index = index + 1;
+  }
+  return Ok(Counts { ready: ready, leased: leased, delayed: delayed, dead_lettered: dead_lettered });
 }
 
 pub fn restore_job(queue: &mut Queue, id: Int, payload: Bytes, attempt: Int, max_retries: Int, job_state: JobState) -> Ack
