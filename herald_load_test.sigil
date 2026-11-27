@@ -18,6 +18,10 @@ use herald_persistence.open_persistent;
 use herald_persistence.queue_counts;
 use herald_persistence.set_io;
 use herald_queue.JobState;
+use herald_queue.ack;
+use herald_queue.dequeue;
+use herald_queue.enqueue;
+use herald_queue.new_queue;
 use herald_server.default_config;
 use herald_server.listen_on;
 use herald_server.open_hub;
@@ -306,6 +310,22 @@ fn mass_job_lifecycle(port: Int) -> Result<Bool, Int>
     return Err(207);
   }
 
+  // Verify bounded backing-array slot reuse directly on the in-memory queue:
+  // If enqueue stops reusing empty slots and always appends, slots would grow to 30.
+  // With slot reuse, allocated slot count remains bounded at 1.
+  let mut direct_queue = new_queue();
+  let mut s = 1;
+  while s <= 30 {
+    let qp = payload_of(12, s);
+    let qid = enqueue(&mut direct_queue, 1000 + s, qp, 0, None).map_err(|e| 220)?;
+    let qitem = dequeue(&mut direct_queue, 1000 + s, 30).map_err(|e| 221)?.ok_or(222)?;
+    ack(&mut direct_queue, 1000 + s, qitem.id, &qitem.lease_token).map_err(|e| 223)?;
+    s = s + 1;
+  }
+  if direct_queue.slots.len() != 1 {
+    return Err(224);
+  }
+
   // Burst enqueue: 10 jobs at once
   let mut first_burst = 0;
   let mut b = 1;
@@ -336,6 +356,27 @@ fn mass_job_lifecycle(port: Int) -> Result<Bool, Int>
   let stats3 = client.inspect(&"jobs").map_err(|e| 215)?;
   if stats3.ready != 0 || stats3.leased != 0 {
     return Err(216);
+  }
+
+  // Direct burst slot reuse: array expands up to burst count (10), and re-enqueueing reuses freed slots
+  let mut sb = 1;
+  while sb <= 10 {
+    let _ = enqueue(&mut direct_queue, 2000 + sb, payload_of(8, sb + 50), 0, None).map_err(|e| 225)?;
+    sb = sb + 1;
+  }
+  if direct_queue.slots.len() != 10 {
+    return Err(226);
+  }
+  let mut sd = 1;
+  while sd <= 10 {
+    let qitem = dequeue(&mut direct_queue, 2100 + sd, 30).map_err(|e| 227)?.ok_or(228)?;
+    ack(&mut direct_queue, 2100 + sd, qitem.id, &qitem.lease_token).map_err(|e| 229)?;
+    sd = sd + 1;
+  }
+  // Enqueueing one more job reuses an existing free slot; slot array does not expand
+  let _ = enqueue(&mut direct_queue, 3000, payload_of(8, 1), 0, None).map_err(|e| 230)?;
+  if direct_queue.slots.len() != 10 {
+    return Err(231);
   }
 
   return Ok(true);
@@ -415,18 +456,41 @@ fn connection_cap_and_timeout(port: Int) -> Result<Bool, Int>
   c1.ping().map_err(|e| 403)?;
   c2.ping().map_err(|e| 404)?;
 
+  // The third connects (kernel handshake succeeds) and sends a complete PING request.
+  // While both slots are occupied, admission control holds it unserved in backlog, so no response arrives.
+  let mut c3 = send_raw(port, &raw_header(2, 1, 6)).map_err(|c| 405)?;
+  match task.timeout(150, || read_n(&mut c3, 4)) {
+    None => {}
+    Some(answer) => {
+      return Err(406);
+    }
+  }
+
+  // Once capacity frees (as c1 and c2 time out after 300 ms of idle I/O timeout), c3 is served.
+  match task.timeout(3000, || read_n(&mut c3, 4)) {
+    Some(Ok(header)) => {
+      if header.read_u32_be(0).unwrap_or(0) != 2 {
+        return Err(407);
+      }
+      let _ = read_n(&mut c3, 2);
+    }
+    _ => {
+      return Err(408);
+    }
+  }
+
   // Send incomplete frame from slow client and verify cut off by I/O timeout (configured to 300 ms)
   let mut half = Bytes.new();
   half.push(0);
   half.push(0);
-  let mut stalled = send_raw(port, &half).map_err(|c| 405)?;
+  let mut stalled = send_raw(port, &half).map_err(|c| 409)?;
   if !closed_by_peer(&mut stalled, 3000) {
-    return Err(406);
+    return Err(410);
   }
 
   // After slow client disconnect, server continues to answer new connections
-  let mut fresh = connect(&host(), port, 3000).map_err(|e| 407)?;
-  fresh.ping().map_err(|e| 408)?;
+  let mut fresh = connect(&host(), port, 3000).map_err(|e| 411)?;
+  fresh.ping().map_err(|e| 412)?;
 
   return Ok(true);
 }
