@@ -216,6 +216,9 @@ fn ready_index(queue: &Queue) -> Int
   return first_index;
 }
 
+// The predictable token identifies a lease within a single process and trust domain.
+// Use cryptographically unpredictable tokens before exposing leases to untrusted
+// workers or over the network. Supply entropy from outside this pure module.
 fn lease_token(job_id: Int, lease_id: Int) -> Bytes
   intent "Encode the job and lease sequence as a 16-byte, queue-local token."
   requires none
