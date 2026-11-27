@@ -1,0 +1,725 @@
+module herald_persistence
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.error_kind_name;
+use db.iohook.IoState;
+use db.relation.ScanOrder;
+use db.relation.column;
+use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_get;
+use db.relation.rel_insert;
+use db.relation.rel_replace;
+use db.relation.rel_scan;
+use db.relation.rel_table_exists;
+use db.types.Value;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use herald_queue.Ack;
+use herald_queue.Delivery;
+use herald_queue.Job;
+use herald_queue.JobState;
+use herald_queue.Queue;
+use herald_queue.QueueError;
+use herald_queue.ack;
+use herald_queue.advance;
+use herald_queue.dequeue;
+use herald_queue.enqueue;
+use herald_queue.inspect;
+use herald_queue.nack;
+use herald_queue.new_queue;
+use herald_queue.recover;
+use herald_queue.restore_job;
+
+pub enum StoreError {
+  Queue(QueueError),
+  PayloadTooLarge,
+  Db(String),
+  Corrupt,
+  CommitUnknown,
+  Stopped,
+}
+
+pub struct Enqueued {
+  id: Int,
+}
+
+pub struct QueueStore {
+  queue: Queue,
+  database: Option<Database>,
+  stopped: Bool,
+}
+
+struct JobRecord {
+  state: Int,
+  deadline: Int,
+  token: Bytes,
+}
+
+pub fn new_memory() -> QueueStore
+  intent "Create a queue without opening a database."
+  requires none
+  ensures none
+  effects none
+{
+  return QueueStore { queue: new_queue(), database: None, stopped: false };
+}
+
+pub fn set_io(store: &mut QueueStore, io: IoState) -> Ack
+  intent "Install a sigil-db I/O hook for recovery tests."
+  requires none
+  ensures none
+  effects none
+{
+  let taken = store.database.take();
+  match taken {
+    Some(handle) => {
+      let mut database = handle;
+      database.io = io;
+      store.database = Some(database);
+    }
+    None => {}
+  }
+  return Ack.Done;
+}
+
+pub fn io_state(store: &QueueStore) -> Option<IoState>
+  intent "Read the current sigil-db I/O hook state for recovery tests."
+  requires none
+  ensures none
+  effects none
+{
+  return match store.database {
+    Some(database) => Some(database.io.clone()),
+    None => None,
+  };
+}
+
+fn db_error(error: &DbError) -> StoreError
+  intent "Translate a core error, preserving the indeterminate commit outcome."
+  requires none
+  ensures none
+  effects none
+{
+  return match error {
+    DbError.CommitUnknown(_) => StoreError.CommitUnknown,
+    _ => StoreError.Db(error_kind_name(&error)),
+  };
+}
+
+fn recover_error(error: QueueError) -> StoreError
+  intent "Wrap a failure from the queue state machine."
+  requires none
+  ensures none
+  effects none
+{
+  return StoreError.Queue(error);
+}
+
+fn finish(database: &mut Database, tx: &mut Tx, outcome: Result<Ack, StoreError>) -> Result<Ack, StoreError>
+  intent "Commit staged mutations or discard the entire transaction on a non-commit failure."
+  requires none
+  ensures none
+  effects fs
+{
+  match outcome {
+    Err(error) => {
+      let _ = tx_rollback(&mut tx, &mut database);
+      return Err(error);
+    }
+    Ok(_) => {}
+  }
+  match tx_commit(&mut tx, &mut database) {
+    Ok(_) => {
+      return Ok(Ack.Done);
+    }
+    Err(error) => {
+      if !database.is_poisoned {
+        let _ = tx_rollback(&mut tx, &mut database);
+      }
+      return Err(db_error(&error));
+    }
+  }
+}
+
+fn max_payload() -> Int
+  intent "Return the ADR 0066 default payload limit in bytes."
+  requires none
+  ensures none
+  effects none
+{
+  return 1048576;
+}
+
+fn chunk_size() -> Int
+  intent "Leave room for the typed key and row framing within a sigil-db row."
+  requires none
+  ensures none
+  effects none
+{
+  return 3000;
+}
+
+fn chunk_key(id: Int, part: Int) -> Value
+  intent "Encode the job ID and the zero-based chunk index into a stable relation key."
+  requires none
+  ensures none
+  effects none
+{
+  let mut key = Bytes.with_capacity(12);
+  key.push_u32_be(id >> 32);
+  key.push_u32_be(id & 4294967295);
+  key.push_u32_be(part);
+  return Value.BytesVal(key);
+}
+
+fn chunk_end(offset: Int, size: Int) -> Int
+  intent "Return the exclusive end of the next payload chunk."
+  requires none
+  ensures none
+  effects none
+{
+  if size - offset < chunk_size() {
+    return size;
+  }
+  return offset + chunk_size();
+}
+
+fn int_at(row: &List<Value>, index: Int) -> Result<Int, StoreError>
+  intent "Read an integer column, rejecting a malformed queue row."
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(index) {
+    Some(Value.IntVal(value)) => Ok(value + 0),
+    _ => Err(StoreError.Corrupt),
+  };
+}
+
+fn bytes_at(row: &List<Value>, index: Int) -> Result<Bytes, StoreError>
+  intent "Read a bytes column, rejecting a malformed queue row."
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(index) {
+    Some(Value.BytesVal(value)) => Ok(value.clone()),
+    _ => Err(StoreError.Corrupt),
+  };
+}
+
+fn record(job: &Job) -> JobRecord
+  intent "Encode state-specific data using stable relation values."
+  requires none
+  ensures none
+  effects none
+{
+  return match job.state {
+    JobState.Ready => JobRecord { state: 0, deadline: 0, token: Bytes.new() },
+    JobState.Leased(expires_at, token) => JobRecord { state: 1, deadline: expires_at, token: token.clone() },
+    JobState.Delayed(visible_at) => JobRecord { state: 2, deadline: visible_at, token: Bytes.new() },
+    JobState.DeadLettered => JobRecord { state: 3, deadline: 0, token: Bytes.new() },
+  };
+}
+
+fn job_row(job: &Job, data: &JobRecord) -> List<Value>
+  intent "Create the typed header row. Payload chunks have a separate relation."
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.IntVal(job.id));
+  row.push(Value.IntVal(job.attempt));
+  row.push(Value.IntVal(job.max_retries));
+  row.push(Value.IntVal(data.state));
+  row.push(Value.IntVal(data.deadline));
+  row.push(Value.BytesVal(data.token.clone()));
+  row.push(Value.IntVal(job.payload.byte_len()));
+  return row;
+}
+
+fn decode_state(row: &List<Value>) -> Result<JobState, StoreError>
+  intent "Decode the stored state and validate its state-specific fields."
+  requires none
+  ensures none
+  effects none
+{
+  let tag = int_at(&row, 3)?;
+  let deadline = int_at(&row, 4)?;
+  let token = bytes_at(&row, 5)?;
+  if tag == 1 && deadline > 0 && token.byte_len() == 16 {
+    return Ok(JobState.Leased(deadline, token));
+  }
+  if !token.is_empty() {
+    return Err(StoreError.Corrupt);
+  }
+  if tag == 2 && deadline > 0 {
+    return Ok(JobState.Delayed(deadline));
+  }
+  if deadline == 0 {
+    if tag == 0 {
+      return Ok(JobState.Ready);
+    }
+    if tag == 3 {
+      return Ok(JobState.DeadLettered);
+    }
+  }
+  return Err(StoreError.Corrupt);
+}
+
+fn expect_row(database: &Database, tx: &mut Tx, table: &String, key: &Value) -> Result<List<Value>, StoreError>
+  intent "Read a required queue row in the current transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  return match rel_get(&database, &mut tx, &table, &key) {
+    Ok(Some(row)) => Ok(row),
+    Ok(None) => Err(StoreError.Corrupt),
+    Err(error) => Err(db_error(&error)),
+  };
+}
+
+fn load_payload(database: &Database, tx: &mut Tx, id: Int, size: Int) -> Result<Bytes, StoreError>
+  intent "Read the chunks of a job in order and validate the stored length."
+  requires none
+  ensures none
+  effects fs
+{
+  if size < 0 || size > max_payload() {
+    return Err(StoreError.Corrupt);
+  }
+  let mut payload = Bytes.with_capacity(size);
+  let mut offset = 0;
+  let mut part = 0;
+  while offset < size {
+    let end = chunk_end(offset, size);
+    let row = expect_row(&database, &mut tx, &"queue_payload", &chunk_key(id, part))?;
+    let chunk = bytes_at(&row, 1)?;
+    if chunk.byte_len() != end - offset {
+      return Err(StoreError.Corrupt);
+    }
+    payload.extend(&chunk);
+    offset = end;
+    part = part + 1;
+  }
+  return Ok(payload);
+}
+
+fn insert_job(database: &Database, tx: &mut Tx, job: &Job) -> Result<Ack, StoreError>
+  intent "Insert a job header and all payload chunks atomically."
+  requires none
+  ensures none
+  effects fs
+{
+  let _ = rel_insert(&database, &mut tx, &"queue_job", &job_row(&job, &record(&job))).map_err(|error| db_error(&error))?;
+  let size = job.payload.byte_len();
+  let mut offset = 0;
+  let mut part = 0;
+  while offset < size {
+    let end = chunk_end(offset, size);
+    let chunk = job.payload.slice(offset, end).map_err(|error| StoreError.Corrupt)?;
+    let mut row = List.new();
+    row.push(chunk_key(job.id, part));
+    row.push(Value.BytesVal(chunk));
+    let _ = rel_insert(&database, &mut tx, &"queue_payload", &row).map_err(|error| db_error(&error))?;
+    offset = end;
+    part = part + 1;
+  }
+  return Ok(Ack.Done);
+}
+
+fn delete_job(database: &Database, tx: &mut Tx, job: &Job) -> Result<Ack, StoreError>
+  intent "Delete the acknowledged header and its payload chunks in one transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  let _ = rel_delete(&database, &mut tx, &"queue_job", &Value.IntVal(job.id)).map_err(|error| db_error(&error))?;
+  let size = job.payload.byte_len();
+  let mut offset = 0;
+  let mut part = 0;
+  while offset < size {
+    let _ = rel_delete(&database, &mut tx, &"queue_payload", &chunk_key(job.id, part)).map_err(|error| db_error(&error))?;
+    offset = chunk_end(offset, size);
+    part = part + 1;
+  }
+  return Ok(Ack.Done);
+}
+
+fn sequences(queue: &Queue) -> List<Value>
+  intent "Encode both sequences in a singleton row, independent of retained jobs."
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.IntVal(0));
+  row.push(Value.IntVal(queue.next_job_id));
+  row.push(Value.IntVal(queue.next_lease_id));
+  return row;
+}
+
+fn create_tables(database: &Database, tx: &mut Tx, queue: &Queue) -> Result<Ack, StoreError>
+  intent "Create the queue relations and initial sequence values on first open."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut meta_columns = List.new();
+  meta_columns.push(column("id", tag_int()));
+  meta_columns.push(column("next_job_id", tag_int()));
+  meta_columns.push(column("next_lease_id", tag_int()));
+  let _ = rel_create_table(&database, &mut tx, &"queue_meta", &meta_columns, &"id").map_err(|error| db_error(&error))?;
+  let _ = rel_insert(&database, &mut tx, &"queue_meta", &sequences(&queue)).map_err(|error| db_error(&error))?;
+
+  let mut job_columns = List.new();
+  job_columns.push(column("id", tag_int()));
+  job_columns.push(column("attempt", tag_int()));
+  job_columns.push(column("max_retries", tag_int()));
+  job_columns.push(column("state", tag_int()));
+  job_columns.push(column("deadline", tag_int()));
+  job_columns.push(column("token", tag_bytes()));
+  job_columns.push(column("payload_size", tag_int()));
+  let _ = rel_create_table(&database, &mut tx, &"queue_job", &job_columns, &"id").map_err(|error| db_error(&error))?;
+
+  let mut payload_columns = List.new();
+  payload_columns.push(column("key", tag_bytes()));
+  payload_columns.push(column("chunk", tag_bytes()));
+  let _ = rel_create_table(&database, &mut tx, &"queue_payload", &payload_columns, &"key").map_err(|error| db_error(&error))?;
+  return Ok(Ack.Done);
+}
+
+fn load_jobs(database: &Database, tx: &mut Tx) -> Result<Queue, StoreError>
+  intent "Build the memory queue from the committed relations and sequence counters."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut queue = new_queue();
+  let meta = expect_row(&database, &mut tx, &"queue_meta", &Value.IntVal(0))?;
+  queue.next_job_id = int_at(&meta, 1)?;
+  queue.next_lease_id = int_at(&meta, 2)?;
+  if queue.next_job_id < 1 || queue.next_lease_id < 1 {
+    return Err(StoreError.Corrupt);
+  }
+
+  let rows = rel_scan(&database, &mut tx, &"queue_job", &None, &None, &ScanOrder.Asc, -1).map_err(|error| db_error(&error))?;
+  let mut index = 0;
+  while index < rows.len() {
+    match rows.get(index) {
+      Some(row) => {
+        let id = int_at(&row, 0)?;
+        let attempt = int_at(&row, 1)?;
+        let retries = int_at(&row, 2)?;
+        let job_state = decode_state(&row)?;
+        if id < 1 || id >= queue.next_job_id || retries < 0 || retries > 4294967295 || attempt < 0 || attempt > retries + 1 {
+          return Err(StoreError.Corrupt);
+        }
+        let payload = load_payload(&database, &mut tx, id, int_at(&row, 6)?)?;
+        let _ = restore_job(&mut queue, id, payload, attempt, retries, job_state);
+      }
+      None => {
+        return Err(StoreError.Corrupt);
+      }
+    }
+    index = index + 1;
+  }
+  return Ok(queue);
+}
+
+fn update_job(database: &Database, tx: &mut Tx, prior: &Job, current: &Job) -> Result<Ack, StoreError>
+  intent "Replace a job header only if a transition changed its state or attempt."
+  requires none
+  ensures none
+  effects fs
+{
+  let previous = record(&prior);
+  let next = record(&current);
+  if prior.attempt != current.attempt || previous.state != next.state || previous.deadline != next.deadline || previous.token != next.token {
+    let _ = rel_replace(&database, &mut tx, &"queue_job", &job_row(&current, &next)).map_err(|error| db_error(&error))?;
+  }
+  return Ok(Ack.Done);
+}
+
+fn slot_job(queue: &Queue, index: Int) -> Option<&Job>
+  intent "Borrow a job by logical slot so comparisons never copy its payload."
+  requires none
+  ensures none
+  effects none
+{
+  return match queue.slots.get(index) {
+    Some(slot) => match slot.job {
+      Some(job) => Some(&job),
+      None => None,
+    },
+    None => None,
+  };
+}
+
+fn save_diff(database: &Database, tx: &mut Tx, previous: &Queue, current: &Queue) -> Result<Ack, StoreError>
+  intent "Stage changed jobs, deletes and new sequence counters in one transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  if previous.next_job_id != current.next_job_id || previous.next_lease_id != current.next_lease_id {
+    let _ = rel_replace(&database, &mut tx, &"queue_meta", &sequences(&current)).map_err(|error| db_error(&error))?;
+  }
+  let mut index = 0;
+  while index < current.slots.len() {
+    match slot_job(&previous, index) {
+      Some(prior) => {
+        match slot_job(&current, index) {
+          Some(job) => {
+            let _ = update_job(&database, &mut tx, &prior, &job)?;
+          }
+          None => {
+            let _ = delete_job(&database, &mut tx, &prior)?;
+          }
+        }
+      }
+      None => {
+        match slot_job(&current, index) {
+          Some(job) => {
+            let _ = insert_job(&database, &mut tx, &job)?;
+          }
+          None => {}
+        }
+      }
+    }
+    index = index + 1;
+  }
+  return Ok(Ack.Done);
+}
+
+fn restore(database: &Database, tx: &mut Tx, now: Int) -> Result<Queue, StoreError>
+  intent "Load committed jobs and stage the recovery transitions before opening."
+  requires none
+  ensures none
+  effects fs
+{
+  let exists = rel_table_exists(&database, &mut tx, &"queue_meta").map_err(|error| db_error(&error))?;
+  let previous = match exists {
+    true => load_jobs(&database, &mut tx)?,
+    false => new_queue(),
+  };
+  let mut current = previous.clone();
+  let _ = recover(&mut current, now).map_err(recover_error)?;
+  if exists {
+    let _ = save_diff(&database, &mut tx, &previous, &current)?;
+  } else {
+    let _ = create_tables(&database, &mut tx, &current)?;
+  }
+  return Ok(current);
+}
+
+fn open_queue(database: &mut Database, now: Int) -> Result<Queue, StoreError>
+  intent "Recover the queue and synchronize any startup transitions."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database).map_err(|error| db_error(&error))?;
+  match restore(&database, &mut tx, now) {
+    Ok(queue) => {
+      let _ = finish(&mut database, &mut tx, Ok(Ack.Done))?;
+      return Ok(queue);
+    }
+    Err(error) => {
+      let _ = tx_rollback(&mut tx, &mut database);
+      return Err(error);
+    }
+  }
+}
+
+pub fn open_persistent(dir: String, db_id: Bytes, now: Int) -> Result<QueueStore, StoreError>
+  intent "Open an exclusive queue and recover using the current UTC Unix time in seconds."
+  requires db_id.byte_len() == 16
+  ensures none
+  effects fs
+{
+  let mut database = open_database(dir, db_id).map_err(|error| db_error(&error))?;
+  match open_queue(&mut database, now) {
+    Ok(queue) => {
+      return Ok(QueueStore { queue: queue, database: Some(database), stopped: false });
+    }
+    Err(error) => {
+      let _ = close_database(database);
+      return Err(error);
+    }
+  }
+}
+
+pub fn close_persistent(store: QueueStore) -> Result<Ack, StoreError>
+  intent "Release the database lock or discard a memory-only store."
+  requires none
+  ensures none
+  effects fs
+{
+  match store.database {
+    Some(database) => {
+      let _ = close_database(database).map_err(|error| db_error(&error))?;
+    }
+    None => {}
+  }
+  return Ok(Ack.Done);
+}
+
+fn persist(database: &mut Database, previous: &Queue, current: &Queue) -> Result<Ack, StoreError>
+  intent "Commit an operation through the core serial transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database).map_err(|error| db_error(&error))?;
+  let written = save_diff(&database, &mut tx, &previous, &current);
+  return finish(&mut database, &mut tx, written);
+}
+
+fn publish(store: &mut QueueStore, current: Queue) -> Result<Ack, StoreError>
+  intent "Publish the candidate state only after sigil-db acknowledges its WAL sync."
+  requires none
+  ensures none
+  effects fs
+{
+  match store.database.take() {
+    Some(handle) => {
+      let mut database = handle;
+      let outcome = persist(&mut database, &store.queue, &current);
+      match &outcome {
+        Err(StoreError.CommitUnknown) => {
+          store.stopped = true;
+        }
+        _ => {}
+      }
+      store.database = Some(database);
+      let _ = outcome?;
+    }
+    None => {}
+  }
+  store.queue = current;
+  return Ok(Ack.Done);
+}
+
+pub fn enqueue_job(store: &mut QueueStore, now: Int, payload: Bytes, delay_seconds: Int, max_retries: Option<Int>) -> Result<Enqueued, StoreError>
+  intent "Return Enqueued only after the job and its sequence are stored."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  if payload.byte_len() > max_payload() {
+    return Err(StoreError.PayloadTooLarge);
+  }
+  if store.database.is_none() {
+    return enqueue(&mut store.queue, now, payload, delay_seconds, max_retries).map(|id| Enqueued { id: id }).map_err(recover_error);
+  }
+  let mut current = store.queue.clone();
+  let outcome = enqueue(&mut current, now, payload, delay_seconds, max_retries).map(|id| Enqueued { id: id }).map_err(recover_error);
+  let _ = publish(&mut store, current)?;
+  return outcome;
+}
+
+pub fn dequeue_job(store: &mut QueueStore, now: Int, lease_seconds: Int) -> Result<Option<Delivery>, StoreError>
+  intent "Lease the earliest visible job and persist its new lease."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  if store.database.is_none() {
+    return dequeue(&mut store.queue, now, lease_seconds).map_err(recover_error);
+  }
+  let mut current = store.queue.clone();
+  let outcome = dequeue(&mut current, now, lease_seconds).map_err(recover_error);
+  let _ = publish(&mut store, current)?;
+  return outcome;
+}
+
+pub fn advance_queue(store: &mut QueueStore, now: Int) -> Result<Ack, StoreError>
+  intent "Persist transitions whose lease or visibility deadline has elapsed."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  if store.database.is_none() {
+    return advance(&mut store.queue, now).map_err(recover_error);
+  }
+  let mut current = store.queue.clone();
+  let outcome = advance(&mut current, now).map_err(recover_error);
+  let _ = publish(&mut store, current)?;
+  return outcome;
+}
+
+pub fn ack_job(store: &mut QueueStore, now: Int, id: Int, token: &Bytes) -> Result<Ack, StoreError>
+  intent "Remove the job and its payload after a valid acknowledgment."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  if store.database.is_none() {
+    return ack(&mut store.queue, now, id, &token).map_err(recover_error);
+  }
+  let mut current = store.queue.clone();
+  let outcome = ack(&mut current, now, id, &token).map_err(recover_error);
+  let _ = publish(&mut store, current)?;
+  return outcome;
+}
+
+pub fn nack_job(store: &mut QueueStore, now: Int, id: Int, token: &Bytes, delay_seconds: Int) -> Result<Ack, StoreError>
+  intent "Persist the retry or dead-letter state after a failed delivery."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  if store.database.is_none() {
+    return nack(&mut store.queue, now, id, &token, delay_seconds).map_err(recover_error);
+  }
+  let mut current = store.queue.clone();
+  let outcome = nack(&mut current, now, id, &token, delay_seconds).map_err(recover_error);
+  let _ = publish(&mut store, current)?;
+  return outcome;
+}
+
+pub fn inspect_job(store: &mut QueueStore, now: Int, id: Int) -> Result<Option<Job>, StoreError>
+  intent "Read a job after committing any due clock transitions."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  if store.database.is_none() {
+    return inspect(&mut store.queue, now, id).map_err(recover_error);
+  }
+  let mut current = store.queue.clone();
+  let outcome = inspect(&mut current, now, id).map_err(recover_error);
+  let _ = publish(&mut store, current)?;
+  return outcome;
+}

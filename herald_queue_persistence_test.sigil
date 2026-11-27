@@ -1,0 +1,264 @@
+module herald_queue_persistence_test
+  targets server
+  trust none
+
+use db.iohook.act_crash;
+use db.iohook.act_fail_io;
+use db.iohook.io_fault;
+use db.iohook.new_io_state;
+use db.iohook.op_wal_sync;
+use herald_persistence.QueueStore;
+use herald_persistence.StoreError;
+use herald_persistence.ack_job;
+use herald_persistence.close_persistent;
+use herald_persistence.dequeue_job;
+use herald_persistence.enqueue_job;
+use herald_persistence.inspect_job;
+use herald_persistence.io_state;
+use herald_persistence.nack_job;
+use herald_persistence.new_memory;
+use herald_persistence.open_persistent;
+use herald_persistence.set_io;
+use herald_queue.JobState;
+
+fn assert_store<T>(outcome: Result<T, StoreError>, code: Int) -> Result<T, Int>
+  intent "Give each unexpected adapter error a distinct failure code."
+  requires none
+  ensures none
+  effects none
+{
+  return match outcome {
+    Ok(value) => Ok(value),
+    Err(_) => Err(code),
+  };
+}
+
+fn db_id() -> Bytes
+  intent "Construct the fixed identifier for the isolated test database."
+  requires none
+  ensures none
+  effects none
+{
+  let mut id = Bytes.new();
+  id.push_u32_be(1);
+  id.push_u32_be(2);
+  id.push_u32_be(3);
+  id.push_u32_be(4);
+  return id;
+}
+
+fn reopen(store: QueueStore, dir: &String, now: Int) -> Result<QueueStore, StoreError>
+  intent "Release the old handle and replay the WAL from the same directory."
+  requires none
+  ensures none
+  effects fs
+{
+  close_persistent(store)?;
+  return open_persistent(dir.clone(), db_id(), now);
+}
+
+fn interrupt_enqueue(store: &mut QueueStore, now: Int, step: Int, action: Int, code: Int) -> Result<Bool, Int>
+  intent "Block a WAL operation and require an indeterminate error in place of Enqueued."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut io = new_io_state();
+  io.faults.push(io_fault(step, action, 0));
+  let _ = set_io(&mut store, io);
+  return match enqueue_job(&mut store, now, Bytes.new(), 0, None) {
+    Err(StoreError.CommitUnknown) => Ok(true),
+    _ => Err(code),
+  };
+}
+
+fn verify_sync(store: &mut QueueStore) -> Result<Bool, Int>
+  intent "Verify WAL sync preceded a successful enqueue and a sync failure prevents Enqueued."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut io = new_io_state();
+  io.recording = true;
+  let _ = set_io(&mut store, io);
+  let enqueued = assert_store(enqueue_job(&mut store, 160, Bytes.new(), 0, None), 64)?;
+  let trace = io_state(&store).ok_or(65)?;
+  // This transaction appends its complete WAL bundle in one write, then syncs.
+  match trace.events.get(1) {
+    None => {
+      return Err(66);
+    }
+    Some(sync) => {
+      if sync.op != op_wal_sync() {
+        return Err(67);
+      }
+    }
+  }
+  interrupt_enqueue(&mut store, 160, 2, act_fail_io(), 68)?;
+  return match inspect_job(&mut store, 160, enqueued.id) {
+    Err(StoreError.Stopped) => Ok(true),
+    _ => Err(80),
+  };
+}
+
+fn recovery(dir: &String) -> Result<Bool, Int>
+  intent "Verify all job states after an interrupted write and two consecutive restarts."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = assert_store(open_persistent(dir.clone(), db_id(), 100), 10)?;
+  let mut payload = Bytes.new();
+  payload.push(0);
+  payload.push(255);
+  let mut offset = 2;
+  while offset < 4100 {
+    payload.push(offset & 255);
+    offset = offset + 1;
+  }
+  let acked = assert_store(enqueue_job(&mut store, 100, Bytes.new(), 0, None), 11)?;
+  let leased = assert_store(enqueue_job(&mut store, 100, payload.clone(), 0, Some(1)), 12)?;
+  let exhausted = assert_store(enqueue_job(&mut store, 100, Bytes.new(), 0, Some(0)), 13)?;
+  let nacked = assert_store(enqueue_job(&mut store, 100, Bytes.new(), 0, None), 14)?;
+  let ready = assert_store(enqueue_job(&mut store, 100, Bytes.new(), 0, None), 15)?;
+  let due = assert_store(enqueue_job(&mut store, 100, Bytes.new(), 50, None), 16)?;
+
+  let first = assert_store(dequeue_job(&mut store, 100, 200), 17)?.ok_or(18)?;
+  if first.id != acked.id {
+    return Err(19);
+  }
+  let _ = assert_store(ack_job(&mut store, 100, first.id, &first.lease_token), 20)?;
+  let old_lease = assert_store(dequeue_job(&mut store, 100, 200), 21)?.ok_or(22)?;
+  let last_lease = assert_store(dequeue_job(&mut store, 100, 200), 23)?.ok_or(24)?;
+  let failed = assert_store(dequeue_job(&mut store, 140, 200), 25)?.ok_or(26)?;
+  if old_lease.id != leased.id || last_lease.id != exhausted.id || failed.id != nacked.id {
+    return Err(27);
+  }
+  let _ = assert_store(nack_job(&mut store, 140, failed.id, &failed.lease_token, 20), 28)?;
+
+  interrupt_enqueue(&mut store, 140, 1, act_crash(), 29)?;
+  let mut restored = assert_store(reopen(store, &dir, 150), 30)?;
+  if assert_store(inspect_job(&mut restored, 150, acked.id), 31)?.is_some() {
+    return Err(32);
+  }
+  if assert_store(inspect_job(&mut restored, 150, due.id + 1), 33)?.is_some() {
+    return Err(34);
+  }
+  let restored_lease = assert_store(inspect_job(&mut restored, 150, leased.id), 35)?.ok_or(36)?;
+  match restored_lease.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(37);
+    }
+  }
+  if restored_lease.attempt != 1 || !ct_eq(&restored_lease.payload, &payload) {
+    return Err(38);
+  }
+  let restored_dlq = assert_store(inspect_job(&mut restored, 150, exhausted.id), 39)?.ok_or(40)?;
+  match restored_dlq.state {
+    JobState.DeadLettered => {}
+    _ => {
+      return Err(41);
+    }
+  }
+  if restored_dlq.attempt != 1 {
+    return Err(42);
+  }
+  let restored_ready = assert_store(inspect_job(&mut restored, 150, ready.id), 43)?.ok_or(44)?;
+  match restored_ready.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(45);
+    }
+  }
+  if restored_ready.attempt != 0 {
+    return Err(46);
+  }
+  let restored_due = assert_store(inspect_job(&mut restored, 150, due.id), 47)?.ok_or(48)?;
+  match restored_due.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(49);
+    }
+  }
+  let restored_nack = assert_store(inspect_job(&mut restored, 150, nacked.id), 50)?.ok_or(51)?;
+  match restored_nack.state {
+    JobState.Delayed(at) => {
+      if at != 160 {
+        return Err(52);
+      }
+    }
+    _ => {
+      return Err(53);
+    }
+  }
+  if restored_nack.attempt != 1 {
+    return Err(54);
+  }
+
+  let mut again = assert_store(reopen(restored, &dir, 160), 55)?;
+  let expired_delay = assert_store(inspect_job(&mut again, 160, nacked.id), 56)?.ok_or(57)?;
+  match expired_delay.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(58);
+    }
+  }
+  if expired_delay.attempt != 1 {
+    return Err(59);
+  }
+  let retry = assert_store(dequeue_job(&mut again, 160, 20), 60)?.ok_or(61)?;
+  if retry.id != leased.id || retry.attempt != 1 || ct_eq(&retry.lease_token, &old_lease.lease_token) {
+    return Err(62);
+  }
+  let _ = assert_store(ack_job(&mut again, 160, retry.id, &retry.lease_token), 63)?;
+  verify_sync(&mut again)?;
+  let _ = assert_store(close_persistent(again), 69)?;
+  return Ok(true);
+}
+
+fn memory_only() -> Result<Bool, Int>
+  intent "Exercise the same adapter API in a new, independent volatile queue."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = new_memory();
+  let item = assert_store(enqueue_job(&mut store, 10, Bytes.new(), 0, None), 70)?;
+  let leased = assert_store(dequeue_job(&mut store, 10, 10), 71)?.ok_or(72)?;
+  if leased.id != item.id {
+    return Err(73);
+  }
+  let _ = assert_store(ack_job(&mut store, 10, leased.id, &leased.lease_token), 74)?;
+  if assert_store(inspect_job(&mut store, 10, item.id), 75)?.is_some() {
+    return Err(76);
+  }
+  let _ = assert_store(enqueue_job(&mut store, 10, Bytes.new(), 0, None), 77)?;
+  let mut independent = new_memory();
+  if assert_store(dequeue_job(&mut independent, 10, 10), 78)?.is_some() {
+    return Err(79);
+  }
+  return Ok(true);
+}
+
+pub fn main() -> Int
+  intent "Report zero on success, or the failing check number."
+  requires none
+  ensures none
+  effects env, fs
+{
+  let dir = env.get(&"HERALD_QUEUE_TEST_DIR").unwrap_or("");
+  if dir == "" {
+    return 1;
+  }
+  match recovery(&dir) {
+    Ok(_) => {}
+    Err(code) => {
+      return code;
+    }
+  }
+  return match memory_only() {
+    Ok(_) => 0,
+    Err(code) => code,
+  };
+}

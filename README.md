@@ -20,3 +20,31 @@ sigil build --root . herald_queue_test.sigil main -o /tmp/herald-queue-test
 ```
 
 テストは固定の時刻を渡し、成功時には `0`、失敗時には検査箇所を示す番号を出力します。
+
+## 永続化アダプター（第2段）
+
+`herald_persistence` は第1段の状態機械を再利用する単一キューのアダプターです。
+`open_persistent(dir, db_id, now)` はデータベースを排他的に開いて WAL を再生し、復旧処理を完了してからキューを返します。
+`db_id` は新規データベースに使う 16 バイトの識別子です。
+`close_persistent` はハンドルを消費し、排他ロックを解放します。
+`new_memory()` で起動すると同じキュー操作をメモリ専用で利用できます。
+操作は `enqueue_job`、`dequeue_job`、`ack_job`、`nack_job`、`advance_queue`、`inspect_job` です。
+
+永続モードの `now` には UTC Unix 秒を渡します。
+再起動時に残っていたリースは失敗を 1 回加算して即時再配送の対象にし、再試行上限を超えたジョブは DLQ に保持します。
+遅延の解除には保存した絶対時刻を使います。
+ジョブの投入、状態遷移、ACK による削除は型付き関係 API の直列トランザクションで行い、`Enqueued` は WAL の同期が成功した後に返します。
+`CommitUnknown` が返った場合は、ハンドルを閉じて再度開き、WAL から復旧してください。
+
+### 固定版と検証
+
+`deps/pins.env` に Sigil コンパイラ・標準ライブラリと sigil-db 核の完全な SHA を記録しています。
+下記の手順は固定版を取得し、sigil-db の `db/` を一時プロジェクトに展開して、復旧試験を評価器とネイティブバイナリで実行します。
+
+```sh
+scripts/fetch-deps.sh
+cargo build --locked --manifest-path .deps/sigil-compiler/Cargo.toml --bin sigil
+scripts/test-persistence.sh
+```
+
+既に用意したコンパイラと核を使う場合は、絶対パスを `SIGIL` と `SIGIL_DB_CORE` に指定できます。
