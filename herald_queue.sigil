@@ -86,8 +86,8 @@ fn retry(job: &mut Job, visible_at: Int, now: Int) -> Ack
   return Ack.Done;
 }
 
-pub fn advance(queue: &mut Queue, now: Int) -> Result<Ack, QueueError>
-  intent "Advance the supplied monotonic clock and apply due state transitions."
+fn advance_to(queue: &mut Queue, now: Int, interrupted: Bool) -> Result<Ack, QueueError>
+  intent "Advance the clock and release due jobs or leases interrupted by restart."
   requires none
   ensures none
   effects none
@@ -111,7 +111,7 @@ pub fn advance(queue: &mut Queue, now: Int) -> Result<Ack, QueueError>
                 }
               }
               JobState.Leased(expires_at, _) => {
-                if expires_at <= now {
+                if interrupted || expires_at <= now {
                   let _ = retry(&mut job, now, now);
                 }
               }
@@ -127,6 +127,15 @@ pub fn advance(queue: &mut Queue, now: Int) -> Result<Ack, QueueError>
     index = index + 1;
   }
   return Ok(Ack.Done);
+}
+
+pub fn advance(queue: &mut Queue, now: Int) -> Result<Ack, QueueError>
+  intent "Advance the supplied monotonic clock and apply due state transitions."
+  requires none
+  ensures none
+  effects none
+{
+  return advance_to(&mut queue, now, false);
 }
 
 fn deadline(queue: &Queue, now: Int, seconds: Int) -> Result<Int, QueueError>
@@ -388,4 +397,23 @@ pub fn inspect(queue: &mut Queue, now: Int, id: Int) -> Result<Option<Job>, Queu
     Some(slot) => Ok(slot.job.clone()),
     None => Ok(None),
   };
+}
+
+pub fn restore_job(queue: &mut Queue, id: Int, payload: Bytes, attempt: Int, max_retries: Int, job_state: JobState) -> Ack
+  intent "Append a validated job loaded from storage without changing its state."
+  requires none
+  ensures none
+  effects none
+{
+  queue.slots.push(Slot { job: Some(Job { id: id, payload: payload, attempt: attempt, max_retries: max_retries, state: job_state }) });
+  return Ack.Done;
+}
+
+pub fn recover(queue: &mut Queue, now: Int) -> Result<Ack, QueueError>
+  intent "Count leases interrupted by restart as failed deliveries and release due delayed jobs."
+  requires none
+  ensures none
+  effects none
+{
+  return advance_to(&mut queue, now, true);
 }
