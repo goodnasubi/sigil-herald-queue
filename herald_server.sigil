@@ -1,0 +1,649 @@
+module herald_server
+  targets server
+  trust none
+
+use herald_persistence.QueueStore;
+use herald_persistence.StoreError;
+use herald_persistence.ack_job;
+use herald_persistence.dequeue_job;
+use herald_persistence.enqueue_job;
+use herald_persistence.nack_job;
+use herald_persistence.new_memory;
+use herald_persistence.open_persistent;
+use herald_persistence.queue_counts;
+use herald_queue.QueueError;
+use herald_wire.Failure;
+use herald_wire.Request;
+use herald_wire.Response;
+use herald_wire.decode_request;
+use herald_wire.encode_response;
+use herald_wire.max_frame;
+use herald_wire.max_wait_seconds;
+use herald_wire.new_leased;
+use herald_wire.new_stats;
+use herald_wire.valid_queue_name;
+
+// TCP server for the versioned binary protocol of ADR 0066 decision 4 (stage 3).
+//
+// - One logical queue per configured name; each is a herald_persistence QueueStore (memory-only, or a sigil-db
+//   database under data_dir/<name> when a data directory is configured). Unknown names are refused.
+// - Listens on 127.0.0.1 unless the operator calls with_listen with another host.
+// - Every connection is its own root task (task.roots). max_connections caps them; further connections wait
+//   unserved in the kernel backlog until a slot frees up.
+// - A connection that does not complete a frame within io_timeout_ms is closed. DEQUEUE long polling is the only
+//   operation that waits longer, and it is bounded by wait_seconds <= 30.
+// - Protocol errors (bad length, version, type, malformed body) are answered with one ERROR frame and the connection
+//   is closed. Queue errors are answered with ERROR and the connection stays open.
+
+pub struct ServerConfig {
+  host: String,
+  port: Int,
+  queues: List<String>,
+  max_connections: Int,
+  io_timeout_ms: Int,
+  poll_ms: Int,
+  data_dir: Option<String>,
+  test_clock: Option<Atomic<Int>>,
+}
+
+pub enum ServerError {
+  NoQueues,
+  InvalidConfig,
+  Open(String),
+  Listen(NetError),
+}
+
+pub struct NamedQueue {
+  name: String,
+  store: QueueStore,
+}
+
+pub struct Registry {
+  queues: List<NamedQueue>,
+  last_now: Int,
+}
+
+pub struct Hub {
+  registry: Lock<Registry>,
+  config: ServerConfig,
+}
+
+struct Session {
+  stream: TcpStream,
+  hub: SyncShared<Hub>,
+}
+
+enum FrameError {
+  Silent,
+  Reject(Failure),
+}
+
+pub fn default_config() -> ServerConfig
+  intent "Loopback-only defaults: port 7480, 64 connections, 10 s I/O timeout, 20 ms long-poll interval, memory-only."
+  requires none
+  ensures none
+  effects none
+{
+  return ServerConfig { host: "127.0.0.1", port: 7480, queues: List.new(), max_connections: 64, io_timeout_ms: 10000, poll_ms: 20, data_dir: None, test_clock: None };
+}
+
+pub fn with_queue(config: ServerConfig, name: String) -> ServerConfig
+  intent "Serve one more named queue."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.queues.push(name);
+  return next;
+}
+
+pub fn with_listen(config: ServerConfig, host: String, port: Int) -> ServerConfig
+  intent "Listen on an explicit address. Anything other than loopback must be an isolated internal network."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.host = host;
+  next.port = port;
+  return next;
+}
+
+pub fn with_limits(config: ServerConfig, max_connections: Int, io_timeout_ms: Int, poll_ms: Int) -> ServerConfig
+  intent "Set the connection cap, the read/write timeout and the long-poll re-check interval."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.max_connections = max_connections;
+  next.io_timeout_ms = io_timeout_ms;
+  next.poll_ms = poll_ms;
+  return next;
+}
+
+pub fn with_data_dir(config: ServerConfig, dir: String) -> ServerConfig
+  intent "Persist every queue as a sigil-db database in a subdirectory of dir."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.data_dir = Some(dir);
+  return next;
+}
+
+pub fn with_test_clock(config: ServerConfig, clock_seconds: Atomic<Int>) -> ServerConfig
+  intent "Read queue time from a shared cell instead of the system clock (tests drive leases and delays with it)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.test_clock = Some(clock_seconds);
+  return next;
+}
+
+fn current_time(config: &ServerConfig) -> Int
+  intent "Seconds for the queue clock: the test cell when configured, otherwise UTC Unix seconds."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  match config.test_clock {
+    Some(cell) => {
+      return cell.load();
+    }
+    None => {}
+  }
+  return clock.unix_seconds().unwrap_or(0);
+}
+
+fn queue_id(name: &String) -> Bytes
+  intent "Derive the fixed 16-byte database id of a queue from its name."
+  requires none
+  ensures none
+  effects none
+{
+  let digest = sha256(&name.as_bytes());
+  return digest.slice(0, 16).unwrap_or(Bytes.new());
+}
+
+fn open_one(config: &ServerConfig, name: &String, now: Int) -> Result<QueueStore, ServerError>
+  intent "Open one queue, in memory or from its database directory."
+  requires none
+  ensures none
+  effects fs
+{
+  match config.data_dir {
+    Some(dir) => {
+      let mut raw_path = dir.as_bytes();
+      raw_path.push(47);
+      raw_path.extend(&name.as_bytes());
+      let path = raw_path.to_string_utf8().map_err(|cause| ServerError.Open(name.clone()))?;
+      return open_persistent(path, queue_id(&name), now).map_err(|error| ServerError.Open(name.clone()));
+    }
+    None => {}
+  }
+  return Ok(new_memory());
+}
+
+pub fn open_hub(config: ServerConfig) -> Result<Hub, ServerError>
+  intent "Validate the configuration and open every configured queue."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  if config.queues.len() == 0 {
+    return Err(ServerError.NoQueues);
+  }
+  if config.max_connections < 1 || config.max_connections > 4096 || config.io_timeout_ms < 10 || config.poll_ms < 1 || config.port < 0 || config.port > 65535 {
+    return Err(ServerError.InvalidConfig);
+  }
+  let now = current_time(&config);
+  let mut queues = List.new();
+  let mut index = 0;
+  while index < config.queues.len() {
+    match config.queues.get(index) {
+      Some(name) => {
+        if !valid_name(&name) {
+          return Err(ServerError.InvalidConfig);
+        }
+        let store = open_one(&config, &name, now)?;
+        queues.push(NamedQueue { name: name.clone(), store: store });
+      }
+      None => {}
+    }
+    index = index + 1;
+  }
+  return Ok(Hub { registry: Lock.new(Registry { queues: queues, last_now: now }), config: config });
+}
+
+fn valid_name(name: &String) -> Bool
+  intent "A configured queue name must satisfy the wire rule so clients can address it."
+  requires none
+  ensures none
+  effects none
+{
+  return valid_queue_name(&name.as_bytes());
+}
+
+pub fn listen_on(config: &ServerConfig) -> Result<TcpListener, ServerError>
+  intent "Open the listening socket on the configured address."
+  requires none
+  ensures none
+  effects net.server
+{
+  return net.listen(&config.host, config.port, 128).map_err(|error| ServerError.Listen(error));
+}
+
+fn store_failure(error: &StoreError) -> Failure
+  intent "Map an adapter error to the wire failure."
+  requires none
+  ensures none
+  effects none
+{
+  return match error {
+    StoreError.Queue(queue_error) => queue_failure(&queue_error),
+    StoreError.PayloadTooLarge => Failure.PayloadTooLarge,
+    _ => Failure.Storage,
+  };
+}
+
+fn queue_failure(error: &QueueError) -> Failure
+  intent "Map a queue state machine error to the wire failure."
+  requires none
+  ensures none
+  effects none
+{
+  return match error {
+    QueueError.InvalidDelay => Failure.InvalidDelay,
+    QueueError.InvalidLease => Failure.InvalidLease,
+    QueueError.InvalidRetries => Failure.InvalidRetries,
+    QueueError.InvalidTime => Failure.InvalidTime,
+    QueueError.DeadlineOverflow => Failure.DeadlineOverflow,
+    QueueError.SequenceExhausted => Failure.SequenceExhausted,
+    QueueError.JobNotFound => Failure.JobNotFound,
+    QueueError.TokenExpired => Failure.TokenExpired,
+  };
+}
+
+fn locate(registry: &Registry, name: &String) -> Int
+  intent "Index of the named queue, or -1."
+  requires none
+  ensures none
+  effects none
+{
+  let mut index = 0;
+  while index < registry.queues.len() {
+    match registry.queues.get(index) {
+      Some(entry) => {
+        if entry.name == name.clone() {
+          return index;
+        }
+      }
+      None => {}
+    }
+    index = index + 1;
+  }
+  return -1;
+}
+
+fn queue_time(registry: &mut Registry, observed: Int) -> Int
+  intent "The queue clock never moves backwards, even if the system clock does."
+  requires none
+  ensures none
+  effects none
+{
+  let mut at = observed;
+  if at < registry.last_now {
+    at = registry.last_now;
+  }
+  registry.last_now = at;
+  return at;
+}
+
+fn run_enqueue(hub: &Hub, name: &String, payload: Bytes, delay: Int, retries: Int) -> Response
+  intent "ENQUEUE one job."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let observed = current_time(&hub.config);
+  match hub.registry.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let registry = held.get_mut();
+      let at = queue_time(&mut registry, observed);
+      let index = locate(&registry, &name);
+      if index < 0 {
+        return Response.Failed(Failure.UnknownQueue);
+      }
+      return match registry.queues.get_mut(index) {
+        Some(entry) => match enqueue_job(&mut entry.store, at, payload, delay, Some(retries)) {
+          Ok(done) => Response.Enqueued(done.id),
+          Err(error) => Response.Failed(store_failure(&error)),
+        },
+        None => Response.Failed(Failure.UnknownQueue),
+      };
+    }
+    Err(broken) => {
+      return Response.Failed(Failure.Storage);
+    }
+  }
+}
+
+fn run_dequeue_once(hub: &Hub, name: &String, lease: Int) -> Response
+  intent "One DEQUEUE attempt without waiting."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let observed = current_time(&hub.config);
+  match hub.registry.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let registry = held.get_mut();
+      let at = queue_time(&mut registry, observed);
+      let index = locate(&registry, &name);
+      if index < 0 {
+        return Response.Failed(Failure.UnknownQueue);
+      }
+      return match registry.queues.get_mut(index) {
+        Some(entry) => match dequeue_job(&mut entry.store, at, lease) {
+          Ok(found) => match found {
+            Some(delivery) => Response.Job(new_leased(delivery.id, delivery.attempt, delivery.lease_token, delivery.payload)),
+            None => Response.NoJob,
+          },
+          Err(error) => Response.Failed(store_failure(&error)),
+        },
+        None => Response.Failed(Failure.UnknownQueue),
+      };
+    }
+    Err(broken) => {
+      return Response.Failed(Failure.Storage);
+    }
+  }
+}
+
+fn run_dequeue(hub: &Hub, name: &String, lease: Int, wait: Int) -> Response
+  intent "DEQUEUE with long polling: retry every poll_ms until a job appears or wait_seconds have passed."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  if wait > max_wait_seconds() {
+    return Response.Failed(Failure.InvalidWait);
+  }
+  let polls = wait * 1000 / hub.config.poll_ms;
+  let mut attempt = 0;
+  while true {
+    let outcome = run_dequeue_once(&hub, &name, lease);
+    match outcome {
+      Response.NoJob => {
+        if attempt >= polls {
+          return Response.NoJob;
+        }
+      }
+      _ => {
+        return outcome;
+      }
+    }
+    task.sleep(hub.config.poll_ms);
+    attempt = attempt + 1;
+  }
+  return Response.NoJob;
+}
+
+fn run_ack(hub: &Hub, name: &String, id: Int, token: &Bytes) -> Response
+  intent "ACK a leased job."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let observed = current_time(&hub.config);
+  match hub.registry.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let registry = held.get_mut();
+      let at = queue_time(&mut registry, observed);
+      let index = locate(&registry, &name);
+      if index < 0 {
+        return Response.Failed(Failure.UnknownQueue);
+      }
+      return match registry.queues.get_mut(index) {
+        Some(entry) => match ack_job(&mut entry.store, at, id, &token) {
+          Ok(done) => Response.Done,
+          Err(error) => Response.Failed(store_failure(&error)),
+        },
+        None => Response.Failed(Failure.UnknownQueue),
+      };
+    }
+    Err(broken) => {
+      return Response.Failed(Failure.Storage);
+    }
+  }
+}
+
+fn run_nack(hub: &Hub, name: &String, id: Int, token: &Bytes, delay: Int) -> Response
+  intent "NACK a leased job."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let observed = current_time(&hub.config);
+  match hub.registry.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let registry = held.get_mut();
+      let at = queue_time(&mut registry, observed);
+      let index = locate(&registry, &name);
+      if index < 0 {
+        return Response.Failed(Failure.UnknownQueue);
+      }
+      return match registry.queues.get_mut(index) {
+        Some(entry) => match nack_job(&mut entry.store, at, id, &token, delay) {
+          Ok(done) => Response.Done,
+          Err(error) => Response.Failed(store_failure(&error)),
+        },
+        None => Response.Failed(Failure.UnknownQueue),
+      };
+    }
+    Err(broken) => {
+      return Response.Failed(Failure.Storage);
+    }
+  }
+}
+
+fn run_inspect(hub: &Hub, name: &String) -> Response
+  intent "INSPECT the per-state counts of one queue."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let observed = current_time(&hub.config);
+  match hub.registry.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let registry = held.get_mut();
+      let at = queue_time(&mut registry, observed);
+      let index = locate(&registry, &name);
+      if index < 0 {
+        return Response.Failed(Failure.UnknownQueue);
+      }
+      return match registry.queues.get_mut(index) {
+        Some(entry) => match queue_counts(&mut entry.store, at) {
+          Ok(counts) => Response.Stats(new_stats(counts.ready, counts.leased, counts.delayed, counts.dead_lettered)),
+          Err(error) => Response.Failed(store_failure(&error)),
+        },
+        None => Response.Failed(Failure.UnknownQueue),
+      };
+    }
+    Err(broken) => {
+      return Response.Failed(Failure.Storage);
+    }
+  }
+}
+
+pub fn execute(hub: &Hub, request: Request) -> Response
+  intent "Run one decoded request against the queues."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  return match request {
+    Request.Ping => Response.Done,
+    Request.Enqueue(name, payload, delay, retries) => run_enqueue(&hub, &name, payload, delay, retries),
+    Request.Dequeue(name, lease, wait) => run_dequeue(&hub, &name, lease, wait),
+    Request.Ack(name, id, token) => run_ack(&hub, &name, id, &token),
+    Request.Nack(name, id, token, delay) => run_nack(&hub, &name, id, &token, delay),
+    Request.Inspect(name) => run_inspect(&hub, &name),
+  };
+}
+
+fn read_exact(stream: &TcpStream, count: Int) -> Result<Bytes, Int>
+  intent "Read exactly count bytes; Err(0) on EOF or a socket error."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut out = Bytes.with_capacity(count);
+  while out.byte_len() < count {
+    let want = count - out.byte_len();
+    let mut chunk = want;
+    if chunk > 65536 {
+      chunk = 65536;
+    }
+    match stream.read(chunk) {
+      Ok(piece) => {
+        if piece.byte_len() == 0 {
+          return Err(0);
+        }
+        out.extend(&piece);
+      }
+      Err(error) => {
+        return Err(0);
+      }
+    }
+  }
+  return Ok(out);
+}
+
+fn read_frame(stream: &TcpStream) -> Result<Bytes, FrameError>
+  intent "Read one frame without trusting its length: the length is checked against the limit before the body is read."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut header = Bytes.new();
+  match read_exact(&stream, 4) {
+    Ok(bytes) => {
+      header = bytes;
+    }
+    Err(code) => {
+      return Err(FrameError.Silent);
+    }
+  }
+  let length = header.read_u32_be(0).unwrap_or(0);
+  if length > max_frame() {
+    return Err(FrameError.Reject(Failure.FrameTooLarge));
+  }
+  if length < 2 {
+    return Err(FrameError.Reject(Failure.Malformed));
+  }
+  return match read_exact(&stream, length) {
+    Ok(body) => Ok(body),
+    Err(code) => Err(FrameError.Silent),
+  };
+}
+
+fn send(stream: &TcpStream, response: &Response, timeout_ms: Int) -> Bool
+  intent "Write one response frame within the I/O timeout."
+  requires none
+  ensures none
+  effects clock, net.server, task.spawn, task.suspend
+{
+  let frame = encode_response(&response);
+  return match task.timeout(timeout_ms, || stream.write_all(&frame)) {
+    Some(written) => written.is_ok(),
+    None => false,
+  };
+}
+
+fn serve_session(session: &Session)
+  intent "Serve requests on one connection until it closes, times out or breaks the protocol."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let hub = session.hub.borrow();
+  let timeout_ms = hub.config.io_timeout_ms;
+  while true {
+    let read = task.timeout(timeout_ms, || read_frame(&session.stream));
+    match read {
+      None => {
+        return;
+      }
+      Some(outcome) => {
+        match outcome {
+          Err(FrameError.Silent) => {
+            return;
+          }
+          Err(FrameError.Reject(failure)) => {
+            let sent = send(&session.stream, &Response.Failed(failure), timeout_ms);
+            return;
+          }
+          Ok(body) => {
+            match decode_request(&body) {
+              Err(failure) => {
+                let sent = send(&session.stream, &Response.Failed(failure), timeout_ms);
+                return;
+              }
+              Ok(request) => {
+                let response = execute(&hub, request);
+                if !send(&session.stream, &response, timeout_ms) {
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub fn share_hub(hub: Hub) -> SyncShared<Hub>
+  intent "Make the opened queues shareable between the connection tasks."
+  requires none
+  ensures none
+  effects none
+{
+  return SyncShared.new(hub);
+}
+
+pub fn serve(listener: &TcpListener, hub: &SyncShared<Hub>) -> Int
+  intent "Accept connections forever, each as an isolated root task; returns only if the accept loop is cancelled."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let limit = hub.borrow().config.max_connections;
+  return task.roots(limit, |group| {
+    while true {
+      let slot = group.reserve();
+      match listener.accept() {
+        Ok(stream) => {
+          slot.start(Session { stream: stream, hub: hub.clone() }, move |session| {
+            serve_session(&session);
+          }, move |session| {});
+        }
+        Err(error) => {
+          task.sleep(10);
+        }
+      }
+    }
+    return 0;
+  });
+}

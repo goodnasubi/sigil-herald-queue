@@ -25,6 +25,7 @@ use db.types.Value;
 use db.types.tag_bytes;
 use db.types.tag_int;
 use herald_queue.Ack;
+use herald_queue.Counts;
 use herald_queue.Delivery;
 use herald_queue.Job;
 use herald_queue.JobState;
@@ -32,6 +33,7 @@ use herald_queue.Queue;
 use herald_queue.QueueError;
 use herald_queue.ack;
 use herald_queue.advance;
+use herald_queue.counts;
 use herald_queue.dequeue;
 use herald_queue.enqueue;
 use herald_queue.inspect;
@@ -722,4 +724,17 @@ pub fn inspect_job(store: &mut QueueStore, now: Int, id: Int) -> Result<Option<J
   let outcome = inspect(&mut current, now, id).map_err(recover_error);
   let _ = publish(&mut store, current)?;
   return outcome;
+}
+
+pub fn queue_counts(store: &mut QueueStore, now: Int) -> Result<Counts, StoreError>
+  intent "Count retained jobs by state after committing any due clock transitions."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  let _ = advance_queue(&mut store, now)?;
+  return counts(&mut store.queue, now).map_err(recover_error);
 }
