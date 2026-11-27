@@ -1,0 +1,300 @@
+module herald_queue_test
+  targets server
+  trust none
+
+use herald_queue.JobState;
+use herald_queue.QueueError;
+use herald_queue.ack;
+use herald_queue.advance;
+use herald_queue.dequeue;
+use herald_queue.enqueue;
+use herald_queue.inspect;
+use herald_queue.nack;
+use herald_queue.new_queue;
+
+// Each test drives the clock by passing explicit timestamps to the queue.
+
+fn assert_queue<T>(outcome: Result<T, QueueError>, code: Int) -> Result<T, Int>
+  intent "Give unexpected queue errors a test-specific failure code."
+  requires none
+  ensures none
+  effects none
+{
+  return match outcome {
+    Ok(value) => Ok(value),
+    Err(_) => Err(code),
+  };
+}
+
+fn fifo_ack() -> Result<Bool, Int>
+  intent "Check FIFO, slot reuse, binary payloads, and ACK deletion."
+  requires none
+  ensures none
+  effects none
+{
+  let mut queue = new_queue();
+  let mut payload = Bytes.new();
+  payload.push(0);
+  payload.push(255);
+  let first = assert_queue(enqueue(&mut queue, 100, payload.clone(), 0, None), 100)?;
+  let second = assert_queue(enqueue(&mut queue, 100, Bytes.new(), 0, None), 100)?;
+  let initial = assert_queue(inspect(&mut queue, 100, first), 100)?.ok_or(101)?;
+  match initial.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(102);
+    }
+  }
+  let delivery = assert_queue(dequeue(&mut queue, 100, 30), 100)?.ok_or(103)?;
+  if delivery.id != first || delivery.attempt != 0 || !ct_eq(&delivery.payload, &payload) || delivery.lease_token.byte_len() != 16 {
+    return Err(104);
+  }
+  assert_queue(ack(&mut queue, 129, first, &delivery.lease_token), 100)?;
+  if !assert_queue(inspect(&mut queue, 129, first), 100)?.is_none() {
+    return Err(105);
+  }
+  let third = assert_queue(enqueue(&mut queue, 129, Bytes.new(), 0, None), 100)?;
+  if third <= second || second <= first {
+    return Err(106);
+  }
+  let next = assert_queue(dequeue(&mut queue, 129, 30), 100)?.ok_or(107)?;
+  if next.id != second {
+    return Err(108);
+  }
+  return Ok(true);
+}
+
+fn lease_expiry() -> Result<Bool, Int>
+  intent "Check invisibility, exact expiry, and rejection of stale ACK and NACK."
+  requires none
+  ensures none
+  effects none
+{
+  let mut queue = new_queue();
+  let id = assert_queue(enqueue(&mut queue, 100, Bytes.new(), 0, None), 200)?;
+  let original = assert_queue(dequeue(&mut queue, 100, 30), 200)?.ok_or(201)?;
+  let leased = assert_queue(inspect(&mut queue, 129, id), 200)?.ok_or(202)?;
+  match leased.state {
+    JobState.Leased(expires_at, token) => {
+      if expires_at != 130 || !ct_eq(&token, &original.lease_token) {
+        return Err(203);
+      }
+    }
+    _ => {
+      return Err(204);
+    }
+  }
+  let wrong_token = Bytes.new();
+  match ack(&mut queue, 129, id, &wrong_token) {
+    Err(QueueError.TokenExpired) => {}
+    _ => {
+      return Err(211);
+    }
+  }
+  if !assert_queue(dequeue(&mut queue, 129, 30), 200)?.is_none() {
+    return Err(205);
+  }
+  match ack(&mut queue, 130, id, &original.lease_token) {
+    Err(QueueError.TokenExpired) => {}
+    _ => {
+      return Err(206);
+    }
+  }
+  let redelivery = assert_queue(dequeue(&mut queue, 130, 30), 200)?.ok_or(207)?;
+  if redelivery.id != id || redelivery.attempt != 1 || ct_eq(&redelivery.lease_token, &original.lease_token) {
+    return Err(208);
+  }
+  match ack(&mut queue, 130, id, &original.lease_token) {
+    Err(QueueError.TokenExpired) => {}
+    _ => {
+      return Err(209);
+    }
+  }
+  match nack(&mut queue, 130, id, &original.lease_token, 0) {
+    Err(QueueError.TokenExpired) => {}
+    _ => {
+      return Err(210);
+    }
+  }
+  assert_queue(ack(&mut queue, 130, id, &redelivery.lease_token), 200)?;
+  return Ok(true);
+}
+
+fn delay_nack() -> Result<Bool, Int>
+  intent "Check the exact boundaries for delayed enqueue and NACK backoff."
+  requires none
+  ensures none
+  effects none
+{
+  let mut queue = new_queue();
+  let id = assert_queue(enqueue(&mut queue, 100, Bytes.new(), 5, None), 300)?;
+  let delayed = assert_queue(inspect(&mut queue, 104, id), 300)?.ok_or(301)?;
+  match delayed.state {
+    JobState.Delayed(visible_at) => {
+      if visible_at != 105 {
+        return Err(302);
+      }
+    }
+    _ => {
+      return Err(302);
+    }
+  }
+  if !assert_queue(dequeue(&mut queue, 104, 30), 300)?.is_none() {
+    return Err(303);
+  }
+  let ready_id = assert_queue(enqueue(&mut queue, 104, Bytes.new(), 0, None), 300)?;
+  let ready = assert_queue(dequeue(&mut queue, 104, 30), 300)?.ok_or(312)?;
+  if ready.id != ready_id {
+    return Err(313);
+  }
+  assert_queue(ack(&mut queue, 104, ready_id, &ready.lease_token), 300)?;
+  let first = assert_queue(dequeue(&mut queue, 105, 30), 300)?.ok_or(304)?;
+  if first.id != id {
+    return Err(314);
+  }
+  assert_queue(nack(&mut queue, 110, id, &first.lease_token, 10), 300)?;
+  let backoff = assert_queue(inspect(&mut queue, 119, id), 300)?.ok_or(305)?;
+  match backoff.state {
+    JobState.Delayed(visible_at) => {
+      if visible_at != 120 {
+        return Err(306);
+      }
+    }
+    _ => {
+      return Err(306);
+    }
+  }
+  if !assert_queue(dequeue(&mut queue, 119, 30), 300)?.is_none() {
+    return Err(307);
+  }
+  let second = assert_queue(dequeue(&mut queue, 120, 30), 300)?.ok_or(308)?;
+  if second.id != id || second.attempt != 1 {
+    return Err(309);
+  }
+  assert_queue(nack(&mut queue, 120, id, &second.lease_token, 0), 300)?;
+  let third = assert_queue(dequeue(&mut queue, 120, 30), 300)?.ok_or(310)?;
+  if third.id != id || third.attempt != 2 {
+    return Err(311);
+  }
+  return Ok(true);
+}
+
+fn retry_limit() -> Result<Bool, Int>
+  intent "Check three default retries, terminal NACK, and timeout with zero retries."
+  requires none
+  ensures none
+  effects none
+{
+  let mut queue = new_queue();
+  let mut payload = Bytes.new();
+  payload.push(42);
+  let id = assert_queue(enqueue(&mut queue, 100, payload.clone(), 0, None), 400)?;
+  let mut attempt = 0;
+  while attempt <= 3 {
+    let delivery = assert_queue(dequeue(&mut queue, 100, 30), 400)?.ok_or(401)?;
+    if delivery.id != id || delivery.attempt != attempt {
+      return Err(402);
+    }
+    assert_queue(nack(&mut queue, 100, id, &delivery.lease_token, 0), 400)?;
+    attempt = attempt + 1;
+  }
+  let failed = assert_queue(inspect(&mut queue, 100, id), 400)?.ok_or(403)?;
+  match failed.state {
+    JobState.DeadLettered => {}
+    _ => {
+      return Err(404);
+    }
+  }
+  if failed.attempt != 4 || failed.max_retries != 3 || !ct_eq(&failed.payload, &payload) {
+    return Err(405);
+  }
+  let no_retry = assert_queue(enqueue(&mut queue, 100, Bytes.new(), 0, Some(0)), 400)?;
+  let initial = assert_queue(dequeue(&mut queue, 100, 1), 400)?.ok_or(406)?;
+  if initial.id != no_retry || !assert_queue(dequeue(&mut queue, 101, 1), 400)?.is_none() {
+    return Err(407);
+  }
+  assert_queue(advance(&mut queue, 102), 400)?;
+  let expired = assert_queue(inspect(&mut queue, 102, no_retry), 400)?.ok_or(408)?;
+  match expired.state {
+    JobState.DeadLettered => {}
+    _ => {
+      return Err(409);
+    }
+  }
+  if expired.attempt != 1 || expired.max_retries != 0 {
+    return Err(410);
+  }
+  return Ok(true);
+}
+
+fn invalid_inputs() -> Result<Bool, Int>
+  intent "Check the delay range, deadline overflow, and monotonic clock."
+  requires none
+  ensures none
+  effects none
+{
+  let mut queue = new_queue();
+  match enqueue(&mut queue, 100, Bytes.new(), 86401, None) {
+    Err(QueueError.InvalidDelay) => {}
+    _ => {
+      return Err(501);
+    }
+  }
+  let id = assert_queue(enqueue(&mut queue, 100, Bytes.new(), 86400, None), 500)?;
+  match advance(&mut queue, 99) {
+    Err(QueueError.InvalidTime) => {}
+    _ => {
+      return Err(502);
+    }
+  }
+  match dequeue(&mut queue, 9223372036854775807, 1) {
+    Err(QueueError.DeadlineOverflow) => {}
+    _ => {
+      return Err(503);
+    }
+  }
+  let delivery = assert_queue(dequeue(&mut queue, 86500, 1), 500)?.ok_or(504)?;
+  if delivery.id != id {
+    return Err(505);
+  }
+  return Ok(true);
+}
+
+pub fn main() -> Int
+  intent "Return zero on success or the number of the failed assertion."
+  requires none
+  ensures none
+  effects none
+{
+  match fifo_ack() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match lease_expiry() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match delay_nack() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match retry_limit() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  match invalid_inputs() {
+    Err(code) => {
+      return code;
+    }
+    Ok(_) => {}
+  }
+  return 0;
+}
