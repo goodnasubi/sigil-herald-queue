@@ -1,0 +1,388 @@
+module herald_queue
+  targets server
+  trust none
+
+pub enum JobState {
+  Ready,
+  Leased(Int, Bytes),
+  Delayed(Int),
+  DeadLettered,
+}
+
+pub enum QueueError {
+  InvalidDelay,
+  InvalidLease,
+  InvalidRetries,
+  InvalidTime,
+  DeadlineOverflow,
+  SequenceExhausted,
+  JobNotFound,
+  TokenExpired,
+}
+
+pub enum Ack {
+  Done,
+}
+
+pub struct Job {
+  id: Int,
+  payload: Bytes,
+  attempt: Int,
+  max_retries: Int,
+  state: JobState,
+}
+
+pub struct Delivery {
+  id: Int,
+  payload: Bytes,
+  attempt: Int,
+  lease_token: Bytes,
+}
+
+pub struct Slot {
+  job: Option<Job>,
+}
+
+pub struct Queue {
+  slots: List<Slot>,
+  next_job_id: Int,
+  next_lease_id: Int,
+  last_now: Int,
+}
+
+pub fn new_queue() -> Queue
+  intent "Create an empty in-memory queue."
+  requires none
+  ensures none
+  effects none
+{
+  return Queue { slots: List.new(), next_job_id: 1, next_lease_id: 1, last_now: 0 };
+}
+
+fn delayed_state(visible_at: Int, now: Int) -> JobState
+  intent "Choose the state for a job with a known visibility deadline."
+  requires none
+  ensures none
+  effects none
+{
+  if visible_at > now {
+    return JobState.Delayed(visible_at);
+  }
+  return JobState.Ready;
+}
+
+fn retry(job: &mut Job, visible_at: Int, now: Int) -> Ack
+  intent "Count one failed delivery and schedule a retry or retain the job in the DLQ."
+  requires none
+  ensures none
+  effects none
+{
+  job.attempt = job.attempt + 1;
+  if job.attempt > job.max_retries {
+    job.state = JobState.DeadLettered;
+  } else {
+    job.state = delayed_state(visible_at, now);
+  }
+  return Ack.Done;
+}
+
+pub fn advance(queue: &mut Queue, now: Int) -> Result<Ack, QueueError>
+  intent "Advance the supplied monotonic clock and apply due state transitions."
+  requires none
+  ensures none
+  effects none
+{
+  if now < queue.last_now {
+    return Err(QueueError.InvalidTime);
+  }
+  queue.last_now = now;
+
+  let mut index = 0;
+  while index < queue.slots.len() {
+    match queue.slots.get_mut(index) {
+      Some(slot) => {
+        match slot.job.take() {
+          Some(stored) => {
+            let mut job = stored;
+            match &job.state {
+              JobState.Delayed(visible_at) => {
+                if visible_at <= now {
+                  job.state = JobState.Ready;
+                }
+              }
+              JobState.Leased(expires_at, _) => {
+                if expires_at <= now {
+                  let _ = retry(&mut job, now, now);
+                }
+              }
+              _ => {}
+            }
+            slot.job = Some(job);
+          }
+          None => {}
+        }
+      }
+      None => {}
+    }
+    index = index + 1;
+  }
+  return Ok(Ack.Done);
+}
+
+fn deadline(queue: &Queue, now: Int, seconds: Int) -> Result<Int, QueueError>
+  intent "Calculate an absolute deadline without overflowing the queue clock."
+  requires none
+  ensures none
+  effects none
+{
+  if now < queue.last_now {
+    return Err(QueueError.InvalidTime);
+  }
+  if seconds > 9223372036854775807 - now {
+    return Err(QueueError.DeadlineOverflow);
+  }
+  return Ok(now + seconds);
+}
+
+pub fn enqueue(queue: &mut Queue, now: Int, payload: Bytes, delay_seconds: Int, max_retries: Option<Int>) -> Result<Int, QueueError>
+  intent "Enqueue a binary payload with zero or more seconds of delay and a default of three retries."
+  requires none
+  ensures none
+  effects none
+{
+  if delay_seconds < 0 || delay_seconds > 86400 {
+    return Err(QueueError.InvalidDelay);
+  }
+  let retries = max_retries.unwrap_or(3);
+  if retries < 0 || retries > 4294967295 {
+    return Err(QueueError.InvalidRetries);
+  }
+  if queue.next_job_id == 9223372036854775807 {
+    return Err(QueueError.SequenceExhausted);
+  }
+  let visible_at = deadline(&queue, now, delay_seconds)?;
+  advance(&mut queue, now)?;
+  let id = queue.next_job_id;
+  queue.next_job_id = id + 1;
+  let job = Job { id: id, payload: payload, attempt: 0, max_retries: retries, state: delayed_state(visible_at, now) };
+  let mut index = 0;
+  while index < queue.slots.len() {
+    match queue.slots.get_mut(index) {
+      Some(slot) => {
+        if slot.job.is_none() {
+          slot.job = Some(job);
+          return Ok(id);
+        }
+      }
+      None => {}
+    }
+    index = index + 1;
+  }
+  queue.slots.push(Slot { job: Some(job) });
+  return Ok(id);
+}
+
+fn ready_index(queue: &Queue) -> Int
+  intent "Find the earliest enqueued ready job, including when slots have been reused."
+  requires none
+  ensures none
+  effects none
+{
+  let mut first_index = -1;
+  let mut first_id = 9223372036854775807;
+  let mut index = 0;
+  while index < queue.slots.len() {
+    match queue.slots.get(index) {
+      Some(slot) => {
+        match slot.job {
+          Some(job) => {
+            match job.state {
+              JobState.Ready => {
+                if job.id < first_id {
+                  first_id = job.id;
+                  first_index = index;
+                }
+              }
+              _ => {}
+            }
+          }
+          None => {}
+        }
+      }
+      None => {}
+    }
+    index = index + 1;
+  }
+  return first_index;
+}
+
+fn lease_token(job_id: Int, lease_id: Int) -> Bytes
+  intent "Encode the job and lease sequence as a 16-byte, queue-local token."
+  requires none
+  ensures none
+  effects none
+{
+  let mut token = Bytes.with_capacity(16);
+  token.push_u32_be(job_id >> 32);
+  token.push_u32_be(job_id & 4294967295);
+  token.push_u32_be(lease_id >> 32);
+  token.push_u32_be(lease_id & 4294967295);
+  return token;
+}
+
+pub fn dequeue(queue: &mut Queue, now: Int, lease_seconds: Int) -> Result<Option<Delivery>, QueueError>
+  intent "Lease the earliest visible job and issue a fresh token."
+  requires none
+  ensures none
+  effects none
+{
+  if lease_seconds <= 0 || lease_seconds > 4294967295 {
+    return Err(QueueError.InvalidLease);
+  }
+  let expires_at = deadline(&queue, now, lease_seconds)?;
+  advance(&mut queue, now)?;
+  let index = ready_index(&queue);
+  if index < 0 {
+    return Ok(None);
+  }
+  let lease_id = queue.next_lease_id;
+  if lease_id == 9223372036854775807 {
+    return Err(QueueError.SequenceExhausted);
+  }
+  match queue.slots.get_mut(index) {
+    Some(slot) => {
+      match slot.job.take() {
+        Some(stored) => {
+          let mut job = stored;
+          let token = lease_token(job.id, lease_id);
+          job.state = JobState.Leased(expires_at, token.clone());
+          queue.next_lease_id = lease_id + 1;
+          let delivery = Delivery { id: job.id, payload: job.payload.clone(), attempt: job.attempt, lease_token: token };
+          slot.job = Some(job);
+          return Ok(Some(delivery));
+        }
+        None => {}
+      }
+    }
+    None => {}
+  }
+  return Ok(None);
+}
+
+fn job_index(queue: &Queue, id: Int) -> Int
+  intent "Find the slot for a retained job."
+  requires none
+  ensures none
+  effects none
+{
+  let mut index = 0;
+  while index < queue.slots.len() {
+    match queue.slots.get(index) {
+      Some(slot) => {
+        match slot.job {
+          Some(job) => {
+            if job.id == id {
+              return index;
+            }
+          }
+          None => {}
+        }
+      }
+      None => {}
+    }
+    index = index + 1;
+  }
+  return -1;
+}
+
+fn owns_lease(job: &Job, token: &Bytes) -> Bool
+  intent "Check that the token belongs to the current lease after advancing the clock."
+  requires none
+  ensures none
+  effects none
+{
+  return match job.state {
+    JobState.Leased(_, current) => ct_eq(&current, &token),
+    _ => false,
+  };
+}
+
+pub fn ack(queue: &mut Queue, now: Int, id: Int, token: &Bytes) -> Result<Ack, QueueError>
+  intent "Delete a job when its current lease is acknowledged before expiry."
+  requires none
+  ensures none
+  effects none
+{
+  advance(&mut queue, now)?;
+  let index = job_index(&queue, id);
+  if index < 0 {
+    return Err(QueueError.JobNotFound);
+  }
+  match queue.slots.get_mut(index) {
+    Some(slot) => {
+      match slot.job {
+        Some(job) => {
+          if owns_lease(&job, &token) {
+            let _ = slot.job.take();
+            return Ok(Ack.Done);
+          }
+        }
+        None => {}
+      }
+    }
+    None => {}
+  }
+  return Err(QueueError.TokenExpired);
+}
+
+pub fn nack(queue: &mut Queue, now: Int, id: Int, token: &Bytes, delay_seconds: Int) -> Result<Ack, QueueError>
+  intent "Fail a current lease and schedule its next visibility time or move it to the DLQ."
+  requires none
+  ensures none
+  effects none
+{
+  if delay_seconds < 0 || delay_seconds > 86400 {
+    return Err(QueueError.InvalidDelay);
+  }
+  let visible_at = deadline(&queue, now, delay_seconds)?;
+  advance(&mut queue, now)?;
+  let index = job_index(&queue, id);
+  if index < 0 {
+    return Err(QueueError.JobNotFound);
+  }
+  match queue.slots.get_mut(index) {
+    Some(slot) => {
+      match slot.job.take() {
+        Some(stored) => {
+          let mut job = stored;
+          if owns_lease(&job, &token) {
+            let outcome = retry(&mut job, visible_at, now);
+            slot.job = Some(job);
+            return Ok(outcome);
+          }
+          slot.job = Some(job);
+        }
+        None => {}
+      }
+    }
+    None => {}
+  }
+  return Err(QueueError.TokenExpired);
+}
+
+pub fn inspect(queue: &mut Queue, now: Int, id: Int) -> Result<Option<Job>, QueueError>
+  intent "Read a retained job, including its payload and state after advancing the clock."
+  requires none
+  ensures none
+  effects none
+{
+  advance(&mut queue, now)?;
+  let index = job_index(&queue, id);
+  if index < 0 {
+    return Ok(None);
+  }
+  return match queue.slots.get(index) {
+    Some(slot) => Ok(slot.job.clone()),
+    None => Ok(None),
+  };
+}
