@@ -13,7 +13,11 @@ if [[ $(git -C "$core" rev-parse HEAD) != "$SIGIL_DB_CORE_SHA" ]]; then
 fi
 
 scratch="$(mktemp -d)"
-trap 'rm -rf -- "$scratch"' EXIT
+if [[ ${KEEP_SCRATCH:-0} == 1 ]]; then
+  printf 'KEEP_SCRATCH=1: 一時ディレクトリを保持します: %s\n' "$scratch" >&2
+else
+  trap 'rm -rf -- "$scratch"' EXIT
+fi
 project="$scratch/project"
 mkdir "$project"
 git -C "$core" archive "$SIGIL_DB_CORE_SHA" db | tar -xf - -C "$project"
