@@ -54,11 +54,15 @@ phase1_status=0
 ) || phase1_status=$?
 
 echo "Phase 1 terminated with exit code: $phase1_status"
-if [[ "$phase1_status" -eq 0 ]]; then
-  echo "Error: Process succeeded unexpectedly without memory exhaustion" >&2
+if [[ "$phase1_status" -ne 70 ]]; then
+  if [[ "$phase1_status" -eq 0 ]]; then
+    echo "Error: Process succeeded unexpectedly without memory exhaustion" >&2
+  else
+    echo "Error: Expected memory-exhaustion allocation failure abort (exit code 70), but got exit code: $phase1_status" >&2
+  fi
   exit 1
 fi
-echo "Phase 1 confirmed terminated by memory exhaustion (exit code $phase1_status)."
+echo "Phase 1 confirmed terminated by memory exhaustion (exit code 70)."
 
 echo "=== Phase 2: Reopening from disk WAL without memory constraint and verifying recovery ==="
 phase2_output="$(HERALD_MEM_PHASE="2" HERALD_QUEUE_TEST_DIR="$db_dir" "$scratch/mem-test")"
