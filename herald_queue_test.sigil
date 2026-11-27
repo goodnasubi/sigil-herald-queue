@@ -228,7 +228,7 @@ fn retry_limit() -> Result<Bool, Int>
 }
 
 fn invalid_inputs() -> Result<Bool, Int>
-  intent "Check the delay range, deadline overflow, and monotonic clock."
+  intent "Check invalid delays, times, leases, retries, and missing jobs."
   requires none
   ensures none
   effects none
@@ -256,6 +256,43 @@ fn invalid_inputs() -> Result<Bool, Int>
   let delivery = assert_queue(dequeue(&mut queue, 86500, 1), 500)?.ok_or(504)?;
   if delivery.id != id {
     return Err(505);
+  }
+  match dequeue(&mut queue, 86500, 0) {
+    Err(QueueError.InvalidLease) => {}
+    _ => {
+      return Err(506);
+    }
+  }
+  match dequeue(&mut queue, 86500, 4294967296) {
+    Err(QueueError.InvalidLease) => {}
+    _ => {
+      return Err(507);
+    }
+  }
+  match enqueue(&mut queue, 86500, Bytes.new(), 0, Some(-1)) {
+    Err(QueueError.InvalidRetries) => {}
+    _ => {
+      return Err(508);
+    }
+  }
+  match enqueue(&mut queue, 86500, Bytes.new(), 0, Some(4294967296)) {
+    Err(QueueError.InvalidRetries) => {}
+    _ => {
+      return Err(509);
+    }
+  }
+  let missing_id = id + 1;
+  match ack(&mut queue, 86500, missing_id, &delivery.lease_token) {
+    Err(QueueError.JobNotFound) => {}
+    _ => {
+      return Err(510);
+    }
+  }
+  match nack(&mut queue, 86500, missing_id, &delivery.lease_token, 0) {
+    Err(QueueError.JobNotFound) => {}
+    _ => {
+      return Err(511);
+    }
   }
   return Ok(true);
 }
