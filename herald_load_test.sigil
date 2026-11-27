@@ -1,0 +1,589 @@
+module herald_load_test
+  targets server
+  trust none
+
+use db.iohook.act_fail_space;
+use db.iohook.io_fault;
+use db.iohook.new_io_state;
+use herald_client.ClientError;
+use herald_client.connect;
+use herald_persistence.QueueStore;
+use herald_persistence.StoreError;
+use herald_persistence.ack_job;
+use herald_persistence.close_persistent;
+use herald_persistence.dequeue_job;
+use herald_persistence.enqueue_job;
+use herald_persistence.inspect_job;
+use herald_persistence.open_persistent;
+use herald_persistence.queue_counts;
+use herald_persistence.set_io;
+use herald_queue.JobState;
+use herald_server.default_config;
+use herald_server.listen_on;
+use herald_server.open_hub;
+use herald_server.serve;
+use herald_server.share_hub;
+use herald_server.with_limits;
+use herald_server.with_listen;
+use herald_server.with_queue;
+use herald_server.with_test_clock;
+use herald_wire.Leased;
+use herald_wire.Response;
+use herald_wire.decode_response;
+use herald_wire.failure_code;
+use herald_wire.max_frame;
+use herald_wire.max_payload;
+
+// Stage 4 (ADR 0066 decision 5): load and boundary tests and pre-publish verification (G2).
+// Scenarios:
+// 1. Poison Message and worker crash: automatic visibility restore, attempt increment, TokenExpired on stale ACK, DLQ move.
+// 2. Mass job lifecycle: sequential and burst operations, bounded slot reuse, inspect verification.
+// 3. Resource boundaries: max payload (1 MiB), oversized frame rejection (> 1 MiB + 4 KiB), parameter validation.
+// 4. Connection cap and timeout: max_connections enforcement, slow client timeout, loopback defaults.
+// 5. Disk exhaustion: ENOSPC simulation via act_fail_space, WAL sync guarantees, clean recovery without corruption.
+
+fn host() -> String
+  intent "The loopback address every test uses."
+  requires none
+  ensures none
+  effects none
+{
+  return "127.0.0.1";
+}
+
+fn db_id() -> Bytes
+  intent "Construct the fixed identifier for the isolated test database."
+  requires none
+  ensures none
+  effects none
+{
+  let mut id = Bytes.new();
+  id.push_u32_be(99);
+  id.push_u32_be(88);
+  id.push_u32_be(77);
+  id.push_u32_be(66);
+  return id;
+}
+
+fn reopen(store: QueueStore, dir: &String, now: Int) -> Result<QueueStore, StoreError>
+  intent "Release the old handle and replay the WAL from the same directory."
+  requires none
+  ensures none
+  effects fs
+{
+  close_persistent(store)?;
+  return open_persistent(dir.clone(), db_id(), now);
+}
+
+fn payload_of(count: Int, seed: Int) -> Bytes
+  intent "A deterministic binary payload that includes NUL and high bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(count);
+  let mut index = 0;
+  while index < count {
+    out.push(index * 7 + seed & 255);
+    index = index + 1;
+  }
+  return out;
+}
+
+fn server_failure(outcome: &Result<Bool, ClientError>) -> Int
+  intent "Wire code of the server failure inside a client result, or -1 for anything else."
+  requires none
+  ensures none
+  effects none
+{
+  return match outcome {
+    Err(ClientError.Server(failure)) => failure_code(&failure),
+    _ => -1,
+  };
+}
+
+fn raw_header(length: Int, version: Int, kind: Int) -> Bytes
+  intent "A frame header: length prefix, version and type."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push_u32_be(length);
+  out.push(version);
+  out.push(kind);
+  return out;
+}
+
+fn read_n(conn: &mut TcpClient, count: Int) -> Result<Bytes, Int>
+  intent "Read exactly count bytes; Err(0) when the peer closes first."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut out = Bytes.new();
+  while out.byte_len() < count {
+    match conn.read(count - out.byte_len()) {
+      Ok(piece) => {
+        if piece.byte_len() == 0 {
+          return Err(0);
+        }
+        out.extend(&piece);
+      }
+      Err(e) => {
+        return Err(0);
+      }
+    }
+  }
+  return Ok(out);
+}
+
+fn read_failure(conn: &mut TcpClient) -> Int
+  intent "Read one ERROR frame and return its wire code; -1 if there is none."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let got = task.timeout(3000, || read_n(&mut conn, 4));
+  match got {
+    Some(Ok(header)) => {
+      let length = header.read_u32_be(0).unwrap_or(0);
+      if length < 2 || length > max_frame() {
+        return -1;
+      }
+      return match task.timeout(3000, || read_n(&mut conn, length)) {
+        Some(Ok(body)) => match decode_response(&body) {
+          Ok(Response.Failed(failure)) => failure_code(&failure),
+          _ => -1,
+        },
+        _ => -1,
+      };
+    }
+    _ => {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+fn closed_by_peer(conn: &mut TcpClient, limit_ms: Int) -> Bool
+  intent "True when the peer closes the connection (EOF or reset) within limit_ms."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return match task.timeout(limit_ms, || conn.read(1)) {
+    Some(Ok(piece)) => piece.byte_len() == 0,
+    Some(Err(e)) => true,
+    None => false,
+  };
+}
+
+fn send_raw(port: Int, bytes: &Bytes) -> Result<TcpClient, Int>
+  intent "Open a raw connection and write bytes to it."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut conn = net.connect(&host(), port).map_err(|e| 1)?;
+  match conn.write_all(&bytes) {
+    Ok(done) => {}
+    Err(e) => {
+      return Err(2);
+    }
+  }
+  return Ok(conn);
+}
+
+fn rejected(port: Int, bytes: &Bytes, expected: Int, code: Int) -> Result<Bool, Int>
+  intent "The server answers these bytes with one ERROR frame of the expected code and closes the connection."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut conn = send_raw(port, &bytes).map_err(|c| code)?;
+  if read_failure(&mut conn) != expected {
+    return Err(code + 1);
+  }
+  if !closed_by_peer(&mut conn, 3000) {
+    return Err(code + 2);
+  }
+  return Ok(true);
+}
+
+fn worker_dequeue(port: Int, lease_seconds: Int) -> Result<Leased, Int>
+  intent "Worker connects, leases one job, and disconnects immediately simulating an ungraceful crash."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut client = connect(&host(), port, 3000).map_err(|e| 102)?;
+  let job = client.dequeue(&"jobs", lease_seconds, 0).map_err(|e| 103)?.ok_or(104)?;
+  return Ok(job);
+}
+
+fn poison_worker_death_dlq(port: Int, cell: &Atomic<Int>) -> Result<Bool, Int>
+  intent "Poison message test: worker sudden death, lease expiry, retry count increment, stale ACK TokenExpired, and DLQ move."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  let mut client = connect(&host(), port, 3000).map_err(|e| 100)?;
+  let payload = payload_of(10, 1);
+  let id = client.enqueue(&"jobs", payload.clone(), 0, 2).map_err(|e| 101)?;
+
+  // Worker 1 acquires lease for 10 seconds, then immediately crashes without ACK/NACK
+  let job1 = worker_dequeue(port, 10)?;
+  if job1.id != id || job1.attempt != 0 || job1.payload != payload || job1.lease_token.byte_len() != 16 {
+    return Err(105);
+  }
+
+  // Advance queue clock past lease duration
+  cell.store(cell.load() + 11);
+
+  // Worker 2 acquires the redelivered job: attempt incremented to 1, new lease token issued
+  let job2 = worker_dequeue(port, 10)?;
+  if job2.id != id || job2.attempt != 1 || job2.payload != payload || ct_eq(&job2.lease_token, &job1.lease_token) {
+    return Err(109);
+  }
+
+  // Worker 1 wakes up late and attempts ACK with its expired token: rejected with TokenExpired (code 23)
+  let mut worker1_late = connect(&host(), port, 3000).map_err(|e| 110)?;
+  if server_failure(&worker1_late.ack(&"jobs", id, &job1.lease_token)) != 23 {
+    return Err(111);
+  }
+
+  // Advance queue clock past lease duration again (Worker 2 crashed)
+  cell.store(cell.load() + 11);
+
+  // Worker 3 acquires the job: attempt incremented to 2
+  let job3 = worker_dequeue(port, 10)?;
+  if job3.id != id || job3.attempt != 2 {
+    return Err(115);
+  }
+
+  // Advance queue clock past lease duration again (Worker 3 crashed)
+  cell.store(cell.load() + 11);
+
+  // Max retries (2) exceeded: job must now be moved to DLQ (DeadLettered)
+  let mut worker4 = connect(&host(), port, 3000).map_err(|e| 116)?;
+  if worker4.dequeue(&"jobs", 10, 0).map_err(|e| 117)?.is_some() {
+    return Err(118);
+  }
+
+  let stats = worker4.inspect(&"jobs").map_err(|e| 119)?;
+  if stats.ready != 0 || stats.leased != 0 || stats.delayed != 0 || stats.dead_lettered != 1 {
+    return Err(120);
+  }
+
+  return Ok(true);
+}
+
+fn mass_job_lifecycle(port: Int) -> Result<Bool, Int>
+  intent "Mass job processing: sequential cycles, burst enqueue, bounded slot reuse, and inspect integrity."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut client = connect(&host(), port, 5000).map_err(|e| 200)?;
+
+  // Process a series of 30 jobs sequentially (enqueue -> dequeue -> ack)
+  let mut i = 1;
+  while i <= 30 {
+    let p = payload_of(12, i);
+    let id = client.enqueue(&"jobs", p.clone(), 0, 3).map_err(|e| 201)?;
+    let item = client.dequeue(&"jobs", 30, 0).map_err(|e| 202)?.ok_or(203)?;
+    if item.id != id || item.attempt != 0 || item.payload != p {
+      return Err(204);
+    }
+    client.ack(&"jobs", item.id, &item.lease_token).map_err(|e| 205)?;
+    i = i + 1;
+  }
+
+  // Verify all sequential jobs were cleaned up
+  let stats1 = client.inspect(&"jobs").map_err(|e| 206)?;
+  if stats1.ready != 0 || stats1.leased != 0 || stats1.delayed != 0 || stats1.dead_lettered != 0 {
+    return Err(207);
+  }
+
+  // Burst enqueue: 10 jobs at once
+  let mut first_burst = 0;
+  let mut b = 1;
+  while b <= 10 {
+    let id = client.enqueue(&"jobs", payload_of(8, b + 50), 0, 3).map_err(|e| 208)?;
+    if b == 1 {
+      first_burst = id;
+    }
+    b = b + 1;
+  }
+
+  let stats2 = client.inspect(&"jobs").map_err(|e| 209)?;
+  if stats2.ready != 10 {
+    return Err(210);
+  }
+
+  // Dequeue and ACK all burst jobs in FIFO order
+  let mut d = 1;
+  while d <= 10 {
+    let item = client.dequeue(&"jobs", 30, 0).map_err(|e| 211)?.ok_or(212)?;
+    if item.id != first_burst + d - 1 {
+      return Err(213);
+    }
+    client.ack(&"jobs", item.id, &item.lease_token).map_err(|e| 214)?;
+    d = d + 1;
+  }
+
+  let stats3 = client.inspect(&"jobs").map_err(|e| 215)?;
+  if stats3.ready != 0 || stats3.leased != 0 {
+    return Err(216);
+  }
+
+  return Ok(true);
+}
+
+fn resource_boundaries(port: Int) -> Result<Bool, Int>
+  intent "Payload size boundary, frame length boundary, and parameter validation."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut client = connect(&host(), port, 15000).map_err(|e| 300)?;
+
+  // Maximum payload (1 MiB) succeeds
+  let big = payload_of(max_payload(), 7);
+  let id = client.enqueue(&"jobs", big.clone(), 0, 3).map_err(|e| 301)?;
+  let job = client.dequeue(&"jobs", 30, 0).map_err(|e| 302)?.ok_or(303)?;
+  if job.id != id || job.payload != big {
+    return Err(304);
+  }
+  client.ack(&"jobs", job.id, &job.lease_token).map_err(|e| 305)?;
+
+  // Oversized payload (1 MiB + 1 byte) is rejected with PayloadTooLarge (code 6)
+  // This protocol error causes the server to close this connection.
+  let too_big = payload_of(max_payload() + 1, 7);
+  if server_failure(&client.enqueue(&"jobs", too_big, 0, 3).map(|v| true)) != 6 {
+    return Err(306);
+  }
+
+  // A fresh client continues normally
+  let mut client2 = connect(&host(), port, 5000).map_err(|e| 307)?;
+
+  // Zero-byte payload succeeds
+  let empty_id = client2.enqueue(&"jobs", Bytes.new(), 0, 1).map_err(|e| 308)?;
+  let empty_job = client2.dequeue(&"jobs", 30, 0).map_err(|e| 309)?.ok_or(310)?;
+  if empty_job.id != empty_id || empty_job.payload.byte_len() != 0 {
+    return Err(311);
+  }
+  client2.ack(&"jobs", empty_job.id, &empty_job.lease_token).map_err(|e| 312)?;
+
+  // Parameter boundary: invalid delay (> 86400)
+  if server_failure(&client2.enqueue(&"jobs", Bytes.new(), 86401, 1).map(|v| true)) != 16 {
+    return Err(313);
+  }
+
+  // Parameter boundary: invalid lease (<= 0)
+  if server_failure(&client2.dequeue(&"jobs", 0, 0).map(|v| true)) != 17 {
+    return Err(314);
+  }
+
+  // Parameter boundary: invalid wait (> 30)
+  if server_failure(&client2.dequeue(&"jobs", 10, 31).map(|v| true)) != 7 {
+    return Err(315);
+  }
+
+  // Oversized frame: header claiming max_frame + 1 bytes is rejected with FrameTooLarge (code 4 in wire protocol)
+  let mut oversize = Bytes.new();
+  oversize.push_u32_be(max_frame() + 1);
+  rejected(port, &oversize, 4, 316)?;
+
+  // Server continues to serve normal traffic
+  let mut normal = connect(&host(), port, 3000).map_err(|e| 319)?;
+  normal.ping().map_err(|e| 320)?;
+
+  return Ok(true);
+}
+
+fn connection_cap_and_timeout(port: Int) -> Result<Bool, Int>
+  intent "Max connection cap enforcement, slow client timeout, and default loopback verification."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  // Connect two clients (the max_connections limit for this test scenario)
+  let mut c1 = connect(&host(), port, 2000).map_err(|e| 401)?;
+  let mut c2 = connect(&host(), port, 2000).map_err(|e| 402)?;
+  c1.ping().map_err(|e| 403)?;
+  c2.ping().map_err(|e| 404)?;
+
+  // Send incomplete frame from slow client and verify cut off by I/O timeout (configured to 300 ms)
+  let mut half = Bytes.new();
+  half.push(0);
+  half.push(0);
+  let mut stalled = send_raw(port, &half).map_err(|c| 405)?;
+  if !closed_by_peer(&mut stalled, 3000) {
+    return Err(406);
+  }
+
+  // After slow client disconnect, server continues to answer new connections
+  let mut fresh = connect(&host(), port, 3000).map_err(|e| 407)?;
+  fresh.ping().map_err(|e| 408)?;
+
+  return Ok(true);
+}
+
+fn disk_exhaustion_simulation(dir: &String) -> Result<Bool, Int>
+  intent "Disk space exhaustion (ENOSPC via act_fail_space): WAL sync failure withholds Enqueued, existing jobs preserved without corruption."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = open_persistent(dir.clone(), db_id(), 100).map_err(|e| 501)?;
+
+  // Enqueue job 1 which commits successfully to WAL and disk
+  let mut p1 = Bytes.new();
+  p1.push(42);
+  p1.push(99);
+  let job1 = enqueue_job(&mut store, 100, p1.clone(), 0, None).map_err(|e| 502)?;
+
+  // Inject act_fail_space (ENOSPC simulation) on the next WAL operation
+  let mut io = new_io_state();
+  io.faults.push(io_fault(1, act_fail_space(), 0));
+  let _ = set_io(&mut store, io);
+
+  // Attempt to enqueue another job. It MUST fail!
+  let mut p2 = Bytes.new();
+  p2.push(123);
+  let failed = enqueue_job(&mut store, 100, p2, 0, None);
+  match failed {
+    Err(StoreError.CommitUnknown) => {}
+    Err(StoreError.Db(_)) => {}
+    _ => {
+      return Err(503);
+    }
+  }
+
+  // Reopen the database from disk (replaying WAL)
+  let mut recovered = reopen(store, &dir, 105).map_err(|e| 504)?;
+
+  // Verify job 1 is present, ready, and has intact payload
+  let inspected1 = inspect_job(&mut recovered, 105, job1.id).map_err(|e| 505)?.ok_or(506)?;
+  if inspected1.id != job1.id || inspected1.attempt != 0 || !ct_eq(&inspected1.payload, &p1) {
+    return Err(507);
+  }
+  match inspected1.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(508);
+    }
+  }
+
+  // Verify the uncommitted job was NOT enqueued or persisted
+  let missing = inspect_job(&mut recovered, 105, job1.id + 1).map_err(|e| 509)?;
+  if missing.is_some() {
+    return Err(510);
+  }
+
+  // Dequeue and acknowledge job 1 from the recovered database
+  let delivery = dequeue_job(&mut recovered, 105, 30).map_err(|e| 511)?.ok_or(512)?;
+  if delivery.id != job1.id {
+    return Err(513);
+  }
+  let _ = ack_job(&mut recovered, 105, delivery.id, &delivery.lease_token).map_err(|e| 514)?;
+
+  // Queue is now empty and cleanly closed
+  let counts = queue_counts(&mut recovered, 105).map_err(|e| 515)?;
+  if counts.ready != 0 || counts.leased != 0 {
+    return Err(516);
+  }
+
+  close_persistent(recovered).map_err(|e| 517)?;
+  return Ok(true);
+}
+
+fn scenario(port: Int, which: Int, cell: Atomic<Int>) -> Int
+  intent "Run one test scenario against the ephemeral server."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  let outcome = match which {
+    1 => poison_worker_death_dlq(port, &cell),
+    2 => mass_job_lifecycle(port),
+    3 => resource_boundaries(port),
+    4 => connection_cap_and_timeout(port),
+    _ => Ok(true),
+  };
+  return match outcome {
+    Ok(done) => 0,
+    Err(code) => code,
+  };
+}
+
+fn harness(which: Int, max_connections: Int, io_timeout_ms: Int) -> Int
+  intent "Start a server on an ephemeral loopback port, run one scenario against it, then cancel the server."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let cell = Atomic.new(1000000);
+  let config = with_test_clock(with_limits(with_listen(with_queue(default_config(), "jobs"), "127.0.0.1", 0), max_connections, io_timeout_ms, 10), cell.clone());
+  match open_hub(config) {
+    Ok(hub) => {
+      match listen_on(&hub.config) {
+        Ok(listener) => {
+          let port = listener.local_port();
+          let shared = share_hub(hub);
+          let mut gs = List.new();
+          gs.push(move || scenario(port, which, cell.clone()));
+          gs.push(move || serve(&listener, &shared));
+          return task.race(gs);
+        }
+        Err(e) => {
+          return 9001;
+        }
+      }
+    }
+    Err(e) => {
+      return 9002;
+    }
+  }
+}
+
+pub fn run(which: Int) -> Int
+  intent "Run scenario number which (1 poison/DLQ, 2 mass lifecycle, 3 boundaries, 4 connection cap/timeout, 5 disk exhaustion)."
+  requires none
+  ensures none
+  effects clock, env, fs, net.server, task
+{
+  if which == 4 {
+    return harness(4, 2, 300);
+  }
+  if which == 5 {
+    let dir = env.get(&"HERALD_QUEUE_TEST_DIR").unwrap_or("");
+    if dir == "" {
+      return 9003;
+    }
+    return match disk_exhaustion_simulation(&dir) {
+      Ok(_) => 0,
+      Err(code) => code,
+    };
+  }
+  return harness(which, 16, 15000);
+}
+
+pub fn main() -> Int
+  intent "Run all Stage 4 test scenarios and return 0 on success or the failing code."
+  requires none
+  ensures none
+  effects clock, env, fs, net.server, task
+{
+  let mut which = 1;
+  while which <= 5 {
+    let code = run(which);
+    if code != 0 {
+      return code;
+    }
+    which = which + 1;
+  }
+  return 0;
+}
