@@ -1,0 +1,239 @@
+module herald_mem_test
+  targets server
+  trust none
+
+use herald_persistence.ack_job;
+use herald_persistence.close_persistent;
+use herald_persistence.dequeue_job;
+use herald_persistence.enqueue_job;
+use herald_persistence.inspect_job;
+use herald_persistence.open_persistent;
+use herald_persistence.queue_counts;
+use herald_queue.JobState;
+
+fn db_id() -> Bytes
+  intent "Construct the fixed identifier for the isolated test database."
+  requires none
+  ensures none
+  effects none
+{
+  let mut id = Bytes.new();
+  id.push_u32_be(11);
+  id.push_u32_be(22);
+  id.push_u32_be(33);
+  id.push_u32_be(44);
+  return id;
+}
+
+fn payload_p1() -> Bytes
+  intent "Payload for job 1."
+  requires none
+  ensures none
+  effects none
+{
+  let mut p = Bytes.new();
+  p.push(1);
+  p.push(2);
+  p.push(3);
+  p.push(4);
+  return p;
+}
+
+fn payload_p2() -> Bytes
+  intent "Payload for job 2 (ACKed and deleted before crash)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut p = Bytes.new();
+  p.push(10);
+  p.push(20);
+  p.push(30);
+  return p;
+}
+
+fn payload_p3() -> Bytes
+  intent "Payload for job 3 (remains Ready)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut p = Bytes.new();
+  p.push(100);
+  p.push(101);
+  p.push(102);
+  return p;
+}
+
+fn payload_p4() -> Bytes
+  intent "Payload for job 4 (Leased by worker when crash occurs)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut p = Bytes.new();
+  p.push(200);
+  p.push(201);
+  p.push(202);
+  p.push(203);
+  return p;
+}
+
+fn phase1_prepare_and_exhaust(dir: &String) -> Result<Bool, Int>
+  intent "Enqueue, lease, and ACK jobs to disk WAL, then allocate until memory exhaustion (OOM/abort)."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = open_persistent(dir.clone(), db_id(), 100).map_err(|e| 101)?;
+
+  // Job 1: Enqueued -> Dequeued (Leased, 30s)
+  let j1 = enqueue_job(&mut store, 100, payload_p1(), 0, None).map_err(|e| 102)?;
+  let d1 = dequeue_job(&mut store, 100, 30).map_err(|e| 103)?.ok_or(104)?;
+  if d1.id != j1.id {
+    return Err(105);
+  }
+
+  // Job 2: Enqueued -> Dequeued -> ACKed (Committed deletion in WAL)
+  let j2 = enqueue_job(&mut store, 100, payload_p2(), 0, None).map_err(|e| 106)?;
+  let d2 = dequeue_job(&mut store, 100, 30).map_err(|e| 107)?.ok_or(108)?;
+  if d2.id != j2.id {
+    return Err(109);
+  }
+  let _ = ack_job(&mut store, 100, d2.id, &d2.lease_token).map_err(|e| 110)?;
+
+  // Job 3: Enqueued -> Dequeued (Leased, 30s)
+  let j3 = enqueue_job(&mut store, 100, payload_p3(), 0, None).map_err(|e| 111)?;
+  let d3 = dequeue_job(&mut store, 100, 30).map_err(|e| 112)?.ok_or(113)?;
+  if d3.id != j3.id {
+    return Err(114);
+  }
+
+  // Job 4: Enqueued (Ready in WAL)
+  let _ = enqueue_job(&mut store, 100, payload_p4(), 0, None).map_err(|e| 115)?;
+
+  // Verify memory counts before crash: Job 1 leased, Job 3 leased, Job 4 ready
+  let counts = queue_counts(&mut store, 100).map_err(|e| 116)?;
+  if counts.ready != 1 || counts.leased != 2 {
+    return Err(117);
+  }
+
+  // Force memory exhaustion. Under ulimit -v (e.g. 64 MB), this will trigger an OOM abort (exit 70).
+  // Note: We do NOT close the store, simulating sudden process termination by OOM Killer or alloc failure.
+  let mut list = List.new();
+  let mut i = 0;
+  while i < 100000 {
+    let mut chunk = Bytes.with_capacity(1048576);
+    let mut j = 0;
+    while j < 1048576 {
+      chunk.push(65);
+      j = j + 4096;
+    }
+    list.push(chunk);
+    i = i + 1;
+  }
+
+  return Err(118);  // Should never reach here if memory exhaustion occurred
+}
+
+fn phase2_verify_wal_recovery(dir: &String) -> Result<Bool, Int>
+  intent "Reopen from disk WAL after memory exhaustion termination, and verify zero loss of ACKed jobs, no corruption, and correct redelivery of unACKed jobs."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = open_persistent(dir.clone(), db_id(), 200).map_err(|e| 201)?;
+
+  // 1. Verify ACKed job (Job 2) is completely absent (no uncommitted resurrection)
+  let inspected2 = inspect_job(&mut store, 200, 2).map_err(|e| 202)?;
+  if inspected2.is_some() {
+    return Err(203);
+  }
+
+  // 2. Verify Job 1 was restored from Leased to Ready, attempt incremented to 1 (worker died on crash), payload intact
+  let inspected1 = inspect_job(&mut store, 200, 1).map_err(|e| 204)?.ok_or(205)?;
+  if inspected1.id != 1 || inspected1.attempt != 1 || !ct_eq(&inspected1.payload, &payload_p1()) {
+    return Err(206);
+  }
+  match inspected1.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(207);
+    }
+  }
+
+  // 3. Verify Job 3 was restored from Leased to Ready, attempt incremented to 1, payload intact
+  let inspected3 = inspect_job(&mut store, 200, 3).map_err(|e| 208)?.ok_or(209)?;
+  if inspected3.id != 3 || inspected3.attempt != 1 || !ct_eq(&inspected3.payload, &payload_p3()) {
+    return Err(210);
+  }
+  match inspected3.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(211);
+    }
+  }
+
+  // 4. Verify Job 4 remained Ready, attempt == 0, payload intact
+  let inspected4 = inspect_job(&mut store, 200, 4).map_err(|e| 212)?.ok_or(213)?;
+  if inspected4.id != 4 || inspected4.attempt != 0 || !ct_eq(&inspected4.payload, &payload_p4()) {
+    return Err(214);
+  }
+  match inspected4.state {
+    JobState.Ready => {}
+    _ => {
+      return Err(215);
+    }
+  }
+
+  // 5. Verify counts: all 3 surviving jobs are Ready, 0 Leased
+  let counts_recovered = queue_counts(&mut store, 200).map_err(|e| 216)?;
+  if counts_recovered.ready != 3 || counts_recovered.leased != 0 {
+    return Err(217);
+  }
+
+  // 6. Dequeue and ACK all surviving jobs cleanly
+  let rec1 = dequeue_job(&mut store, 200, 30).map_err(|e| 218)?.ok_or(219)?;
+  let _ = ack_job(&mut store, 200, rec1.id, &rec1.lease_token).map_err(|e| 220)?;
+
+  let rec2 = dequeue_job(&mut store, 200, 30).map_err(|e| 221)?.ok_or(222)?;
+  let _ = ack_job(&mut store, 200, rec2.id, &rec2.lease_token).map_err(|e| 223)?;
+
+  let rec3 = dequeue_job(&mut store, 200, 30).map_err(|e| 224)?.ok_or(225)?;
+  let _ = ack_job(&mut store, 200, rec3.id, &rec3.lease_token).map_err(|e| 226)?;
+
+  // 7. Verify queue is now empty
+  let counts_empty = queue_counts(&mut store, 200).map_err(|e| 227)?;
+  if counts_empty.ready != 0 || counts_empty.leased != 0 {
+    return Err(228);
+  }
+
+  close_persistent(store).map_err(|e| 229)?;
+  return Ok(true);
+}
+
+pub fn main() -> Int
+  intent "Entry point for memory exhaustion simulation: phase 1 (exhaustion) or phase 2 (recovery)."
+  requires none
+  ensures none
+  effects env, fs
+{
+  let dir = env.get(&"HERALD_QUEUE_TEST_DIR").unwrap_or("");
+  if dir == "" {
+    return 901;
+  }
+  let phase = env.get(&"HERALD_MEM_PHASE").unwrap_or("1");
+  if phase == "1" {
+    return match phase1_prepare_and_exhaust(&dir) {
+      Ok(_) => 0,
+      Err(code) => code,
+    };
+  }
+  if phase == "2" {
+    return match phase2_verify_wal_recovery(&dir) {
+      Ok(_) => 0,
+      Err(code) => code,
+    };
+  }
+  return 902;
+}
